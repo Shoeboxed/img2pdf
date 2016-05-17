@@ -405,6 +405,10 @@ TIFFBitRevTable = [
     0xFF,
 ]
 
+# workaround for certain JPEGs being identified as MPO
+# see https://github.com/python-pillow/Pillow/issues/1138
+JpegImagePlugin._getmp = lambda x: None
+
 
 class NegativeDimensionError(Exception):
     pass
