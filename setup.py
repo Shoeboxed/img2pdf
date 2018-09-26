@@ -1,6 +1,20 @@
+import sys
 from setuptools import setup
 
-VERSION = "0.2.2-sbx"
+PY3 = sys.version_info[0] >= 3
+
+VERSION = "0.3.1-sbx"
+
+INSTALL_REQUIRES = (
+    'Pillow',
+)
+
+TESTS_REQUIRE = (
+    'pdfrw',
+)
+
+if not PY3:
+    INSTALL_REQUIRES += ('enum34',)
 
 setup(
     name='img2pdf',
@@ -17,9 +31,12 @@ setup(
         'Intended Audience :: Other Audience',
         'Environment :: Console',
         'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: Implementation :: CPython',
+        "Programming Language :: Python :: Implementation :: PyPy",
         'License :: OSI Approved :: GNU Lesser General Public License v3 '
         '(LGPLv3)',
         'Natural Language :: English',
@@ -32,9 +49,11 @@ setup(
     include_package_data=True,
     test_suite='tests.test_suite',
     zip_safe=True,
-    install_requires=(
-        'Pillow',
-    ),
+    install_requires=INSTALL_REQUIRES,
+    tests_requires=TESTS_REQUIRE,
+    extras_require={
+        'test': TESTS_REQUIRE,
+    },
     entry_points='''
     [console_scripts]
     img2pdf = img2pdf:main

@@ -1,11 +1,22 @@
 import unittest
 
-import os
 import img2pdf
+import os
+import struct
+import sys
 import zlib
 from PIL import Image
+from io import StringIO, BytesIO
 
 HERE = os.path.dirname(__file__)
+
+PY3 = sys.version_info[0] >= 3
+
+if PY3:
+    PdfReaderIO = StringIO
+else:
+    PdfReaderIO = BytesIO
+
 
 # convert +set date:create +set date:modify -define png:exclude-chunk=time
 
@@ -15,6 +26,7 @@ psp = (504, 972)     # --pagesize portrait
 isl = (756, 324)     # --imgsize landscape
 isp = (324, 756)     # --imgsize portrait
 border = (162, 270)  # --border
+poster = (97200, 50400)
 # there is no need to have test cases with the same images with inverted
 # orientation (landscape/portrait) because --pagesize and --imgsize are
 # already inverted
@@ -173,22 +185,16 @@ layout_test_cases = [
                                        (504, 972),  (864, 432)),
     (psp,  None, None,   f_enlarge, 1, (972, 504),  (972, 324),    # 069
                                        (972, 504),  (972, 486)),
-    (psp,  None, border, f_into,    0, (504, 972),  (180, 60),     # 070
-                                       (504, 972),  (180, 90)),
-    (psp,  None, border, f_into,    1, (972, 504),  (432, 144),    # 071
-                                       (972, 504),  (360, 180)),
-    (psp,  None, border, f_fill,    0, (504, 972),  (1296, 432),   # 072
-                                       (504, 972),  (864, 432)),
-    (psp,  None, border, f_fill,    1, (972, 504),  (540, 180),    # 073
-                                       (972, 504),  (432, 216)),
-    (psp,  None, border, f_exact,   0, (504, 972),  (180, 432),    # 074
-                                       (504, 972),  (180, 432)),
-    (psp,  None, border, f_exact,   1, (972, 504),  (432, 180),    # 075
-                                       (972, 504),  (432, 180)),
-    (psp,  None, border, f_shrink,  0, (504, 972),  (180, 60),     # 076
-                                       (504, 972),  (180, 90)),
-    (psp,  None, border, f_shrink,  1, (972, 504),  (432, 144),    # 077
-                                       (972, 504),  (360, 180)),
+    (psp,  None, border, f_into,    0, None,  None, None,  None),  # 070
+    (psp,  None, border, f_into,    1, None,  None, None,  None),  # 071
+    (psp,  None, border, f_fill,    0, (504, 972),  (1944, 648),   # 072
+                                       (504, 972),  (1296, 648)),
+    (psp,  None, border, f_fill,    1, (972, 504),  (648, 216),    # 073
+                                       (972, 504),  (648, 324)),
+    (psp,  None, border, f_exact,   0, None,  None, None,  None),  # 074
+    (psp,  None, border, f_exact,   1, None,  None, None,  None),  # 075
+    (psp,  None, border, f_shrink,  0, None,  None, None,  None),  # 076
+    (psp,  None, border, f_shrink,  1, None,  None, None,  None),  # 077
     (psp,  None, border, f_enlarge, 0, (504, 972),  (648, 216),    # 078
                                        (504, 972),  (864, 432)),
     (psp,  None, border, f_enlarge, 1, (972, 504),  (648, 216),    # 079
@@ -296,16 +302,22 @@ layout_test_cases = [
                                        (972, 504),  (972, 486)),
     (psl,  None, None,   f_enlarge, 1, (972, 504),  (972, 324),    # 129
                                        (972, 504),  (972, 486)),
-    (psl,  None, border, f_into,    0, None, None, None, None),    # 130
-    (psl,  None, border, f_into,    1, None, None, None, None),    # 131
-    (psl,  None, border, f_fill,    0, (972, 504),  (648, 216),    # 132
-                                       (972, 504),  (648, 324)),
-    (psl,  None, border, f_fill,    1, (972, 504),  (648, 216),    # 133
-                                       (972, 504),  (648, 324)),
-    (psl,  None, border, f_exact,   0, None, None, None, None),    # 134
-    (psl,  None, border, f_exact,   1, None, None, None, None),    # 135
-    (psl,  None, border, f_shrink,  0, None, None, None, None),    # 136
-    (psl,  None, border, f_shrink,  1, None, None, None, None),    # 137
+    (psl,  None, border, f_into,    0, (972, 504),  (432, 144),    # 130
+                                       (972, 504),  (360, 180)),
+    (psl,  None, border, f_into,    1, (972, 504),  (432, 144),    # 131
+                                       (972, 504),  (360, 180)),
+    (psl,  None, border, f_fill,    0, (972, 504),  (540, 180),    # 132
+                                       (972, 504),  (432, 216)),
+    (psl,  None, border, f_fill,    1, (972, 504),  (540, 180),    # 133
+                                       (972, 504),  (432, 216)),
+    (psl,  None, border, f_exact,   0, (972, 504),  (432, 180),    # 134
+                                       (972, 504),  (432, 180)),
+    (psl,  None, border, f_exact,   1, (972, 504),  (432, 180),    # 135
+                                       (972, 504),  (432, 180)),
+    (psl,  None, border, f_shrink,  0, (972, 504),  (432, 144),    # 136
+                                       (972, 504),  (360, 180)),
+    (psl,  None, border, f_shrink,  1, (972, 504),  (432, 144),    # 137
+                                       (972, 504),  (360, 180)),
     (psl,  None, border, f_enlarge, 0, (972, 504),  (648, 216),    # 138
                                        (972, 504),  (864, 432)),
     (psl,  None, border, f_enlarge, 1, (972, 504),  (648, 216),    # 139
@@ -393,7 +405,32 @@ layout_test_cases = [
                                        (972, 504),  (864, 432)),
     (psl,  isl,  border, f_enlarge, 1, (972, 504),  (756, 252),    # 179
                                        (972, 504),  (864, 432)),
+    (poster, None, None, f_fill,    0, (97200, 50400), (151200, 50400),
+                                       (97200, 50400), (100800, 50400)),
 ]
+
+
+def tiff_header_for_ccitt(width, height, img_size, ccitt_group=4):
+    # Quick and dirty TIFF header builder from
+    # https://stackoverflow.com/questions/2641770
+    tiff_header_struct = '<' + '2s' + 'h' + 'l' + 'h' + 'hhll' * 8 + 'h'
+    return struct.pack(
+        tiff_header_struct,
+        b'II',  # Byte order indication: Little indian
+        42,  # Version number (always 42)
+        8,  # Offset to first IFD
+        8,  # Number of tags in IFD
+        256, 4, 1, width,  # ImageWidth, LONG, 1, width
+        257, 4, 1, height,  # ImageLength, LONG, 1, lenght
+        258, 3, 1, 1,  # BitsPerSample, SHORT, 1, 1
+        259, 3, 1, ccitt_group,  # Compression, SHORT, 1, 4 = CCITT Group 4
+        262, 3, 1, 1,  # Threshholding, SHORT, 1, 0 = WhiteIsZero
+        273, 4, 1, struct.calcsize(
+            tiff_header_struct),  # StripOffsets, LONG, 1, len of header
+        278, 4, 1, height,  # RowsPerStrip, LONG, 1, lenght
+        279, 4, 1, img_size,  # StripByteCounts, LONG, 1, size of image
+        0  # last IFD
+        )
 
 
 def test_suite():
@@ -434,6 +471,10 @@ def test_suite():
     files = os.listdir(os.path.join(HERE, "input"))
     for with_pdfrw, test_name in [(a, b) for a in [True, False]
                                   for b in files]:
+        # we do not test animation.gif with pdfrw because it doesn't support
+        # saving hexadecimal palette data
+        if test_name == 'animation.gif' and with_pdfrw:
+            continue
         inputf = os.path.join(HERE, "input", test_name)
         if not os.path.isfile(inputf):
             continue
@@ -445,90 +486,151 @@ def test_suite():
                 orig_imgdata = inf.read()
             output = img2pdf.convert(orig_imgdata, nodate=True,
                                      with_pdfrw=with_pdfrw)
-            from io import StringIO, BytesIO
             from pdfrw import PdfReader, PdfName, PdfWriter
             from pdfrw.py23_diffs import convert_load, convert_store
-            x = PdfReader(StringIO(convert_load(output)))
+            x = PdfReader(PdfReaderIO(convert_load(output)))
             self.assertEqual(sorted(x.keys()), [PdfName.Info, PdfName.Root,
                              PdfName.Size])
-            self.assertEqual(x.Size, '7')
+            self.assertIn(x.Root.Pages.Count, ('1', '2'))
+            if len(x.Root.Pages.Kids) == '1':
+                self.assertEqual(x.Size, '7')
+                self.assertEqual(len(x.Root.Pages.Kids), 1)
+            elif len(x.Root.Pages.Kids) == '2':
+                self.assertEqual(x.Size, '10')
+                self.assertEqual(len(x.Root.Pages.Kids), 2)
             self.assertEqual(x.Info, {})
             self.assertEqual(sorted(x.Root.keys()), [PdfName.Pages,
                                                      PdfName.Type])
             self.assertEqual(x.Root.Type, PdfName.Catalog)
             self.assertEqual(sorted(x.Root.Pages.keys()),
                              [PdfName.Count, PdfName.Kids, PdfName.Type])
-            self.assertEqual(x.Root.Pages.Count, '1')
             self.assertEqual(x.Root.Pages.Type, PdfName.Pages)
-            self.assertEqual(len(x.Root.Pages.Kids), 1)
-            self.assertEqual(sorted(x.Root.Pages.Kids[0].keys()),
-                             [PdfName.Contents, PdfName.MediaBox,
-                              PdfName.Parent, PdfName.Resources, PdfName.Type])
-            self.assertEqual(x.Root.Pages.Kids[0].MediaBox,
-                             ['0', '0', '115', '48'])
-            self.assertEqual(x.Root.Pages.Kids[0].Parent, x.Root.Pages)
-            self.assertEqual(x.Root.Pages.Kids[0].Type, PdfName.Page)
-            self.assertEqual(x.Root.Pages.Kids[0].Resources.keys(),
-                             [PdfName.XObject])
-            self.assertEqual(x.Root.Pages.Kids[0].Resources.XObject.keys(),
-                             [PdfName.Im0])
-            self.assertEqual(x.Root.Pages.Kids[0].Contents.keys(),
-                             [PdfName.Length])
-            self.assertEqual(x.Root.Pages.Kids[0].Contents.Length,
-                             str(len(x.Root.Pages.Kids[0].Contents.stream)))
-            self.assertEqual(x.Root.Pages.Kids[0].Contents.stream,
-                             "q\n115.0000 0 0 48.0000 0.0000 0.0000 cm\n/Im0 "
-                             "Do\nQ")
-
-            imgprops = x.Root.Pages.Kids[0].Resources.XObject.Im0
-
-            # test if the filter is valid:
-            self.assertIn(
-                imgprops.Filter, [[PdfName.DCTDecode], [PdfName.JPXDecode],
-                                  [PdfName.FlateDecode]])
-            # test if the colorspace is valid
-            self.assertIn(
-                imgprops.ColorSpace, [PdfName.DeviceGray, PdfName.DeviceRGB,
-                                      PdfName.DeviceCMYK])
-            # test if the image has correct size
             orig_img = Image.open(f)
-            self.assertEqual(imgprops.Width, str(orig_img.size[0]))
-            self.assertEqual(imgprops.Height, str(orig_img.size[1]))
-            # if the input file is a jpeg then it should've been copied
-            # verbatim into the PDF
-            if imgprops.Filter in [[PdfName.DCTDecode], [PdfName.JPXDecode]]:
-                self.assertEqual(
-                    x.Root.Pages.Kids[0].Resources.XObject.Im0.stream,
-                    convert_load(orig_imgdata))
-            elif imgprops.Filter == [PdfName.FlateDecode]:
-                # otherwise, the data is flate encoded and has to be equal to
-                # the pixel data of the input image
-                imgdata = zlib.decompress(
-                    convert_store(
-                        x.Root.Pages.Kids[0].Resources.XObject.Im0.stream))
-                colorspace = imgprops.ColorSpace
-                if colorspace == PdfName.DeviceGray:
-                    colorspace = 'L'
-                elif colorspace == PdfName.DeviceRGB:
-                    colorspace = 'RGB'
-                elif colorspace == PdfName.DeviceCMYK:
-                    colorspace = 'CMYK'
-                else:
-                    raise Exception("invalid colorspace")
-                im = Image.frombytes(colorspace, (int(imgprops.Width),
-                                                  int(imgprops.Height)),
-                                     imgdata)
-                if orig_img.mode == '1':
-                    orig_img = orig_img.convert("L")
-                elif orig_img.mode not in ("RGB", "L", "CMYK", "CMYK;I"):
-                    orig_img = orig_img.convert("RGB")
-                self.assertEqual(im.tobytes(), orig_img.tobytes())
-                # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does not have
-                # the close() method
-                try:
-                    im.close()
-                except AttributeError:
-                    pass
+            for pagenum in range(len(x.Root.Pages.Kids)):
+                # retrieve the original image frame that this page was
+                # generated from
+                orig_img.seek(pagenum)
+                cur_page = x.Root.Pages.Kids[pagenum]
+
+                ndpi = orig_img.info.get("dpi", (96.0, 96.0))
+                # In python3, the returned dpi value for some tiff images will
+                # not be an integer but a float. To make the behaviour of
+                # img2pdf the same between python2 and python3, we convert that
+                # float into an integer by rounding.
+                # Search online for the 72.009 dpi problem for more info.
+                ndpi = (int(round(ndpi[0])), int(round(ndpi[1])))
+                imgwidthpx, imgheightpx = orig_img.size
+                pagewidth = 72.0*imgwidthpx/ndpi[0]
+                pageheight = 72.0*imgheightpx/ndpi[1]
+
+                def format_float(f):
+                    if int(f) == f:
+                        return str(int(f))
+                    else:
+                        return ("%.4f" % f).rstrip("0")
+
+                self.assertEqual(sorted(cur_page.keys()),
+                                 [PdfName.Contents, PdfName.MediaBox,
+                                  PdfName.Parent, PdfName.Resources,
+                                  PdfName.Type])
+                self.assertEqual(cur_page.MediaBox,
+                                 ['0', '0', format_float(pagewidth),
+                                  format_float(pageheight)])
+                self.assertEqual(cur_page.Parent, x.Root.Pages)
+                self.assertEqual(cur_page.Type, PdfName.Page)
+                self.assertEqual(cur_page.Resources.keys(),
+                                 [PdfName.XObject])
+                self.assertEqual(cur_page.Resources.XObject.keys(),
+                                 [PdfName.Im0])
+                self.assertEqual(cur_page.Contents.keys(),
+                                 [PdfName.Length])
+                self.assertEqual(cur_page.Contents.Length,
+                                 str(len(cur_page.Contents.stream)))
+                self.assertEqual(cur_page.Contents.stream,
+                                 "q\n%.4f 0 0 %.4f 0.0000 0.0000 cm\n"
+                                 "/Im0 Do\nQ" % (pagewidth, pageheight))
+
+                imgprops = cur_page.Resources.XObject.Im0
+
+                # test if the filter is valid:
+                self.assertIn(
+                    imgprops.Filter, [PdfName.DCTDecode, PdfName.JPXDecode,
+                                      PdfName.FlateDecode,
+                                      [PdfName.CCITTFaxDecode]])
+
+                # test if the image has correct size
+                self.assertEqual(imgprops.Width, str(orig_img.size[0]))
+                self.assertEqual(imgprops.Height, str(orig_img.size[1]))
+                # if the input file is a jpeg then it should've been copied
+                # verbatim into the PDF
+                if imgprops.Filter in [PdfName.DCTDecode,
+                                       PdfName.JPXDecode]:
+                    self.assertEqual(
+                        cur_page.Resources.XObject.Im0.stream,
+                        convert_load(orig_imgdata))
+                elif imgprops.Filter == [PdfName.CCITTFaxDecode]:
+                    tiff_header = tiff_header_for_ccitt(
+                        int(imgprops.Width), int(imgprops.Height),
+                        int(imgprops.Length), 4)
+                    imgio = BytesIO()
+                    imgio.write(tiff_header)
+                    imgio.write(convert_store(
+                        cur_page.Resources.XObject.Im0.stream))
+                    imgio.seek(0)
+                    im = Image.open(imgio)
+                    self.assertEqual(im.tobytes(), orig_img.tobytes())
+                    try:
+                        im.close()
+                    except AttributeError:
+                        pass
+
+                elif imgprops.Filter == PdfName.FlateDecode:
+                    # otherwise, the data is flate encoded and has to be equal
+                    # to the pixel data of the input image
+                    imgdata = zlib.decompress(
+                        convert_store(cur_page.Resources.XObject.Im0.stream))
+                    if imgprops.DecodeParms:
+                        if orig_img.format == 'PNG':
+                            pngidat, palette = img2pdf.parse_png(orig_imgdata)
+                        elif orig_img.format == 'TIFF' \
+                                and orig_img.info['compression'] == "group4":
+                            offset, length = \
+                                    img2pdf.ccitt_payload_location_from_pil(
+                                            orig_img)
+                            pngidat = orig_imgdata[offset:offset+length]
+                        else:
+                            pngbuffer = BytesIO()
+                            orig_img.save(pngbuffer, format="png")
+                            pngidat, palette = img2pdf.parse_png(
+                                    pngbuffer.getvalue())
+                        self.assertEqual(zlib.decompress(pngidat), imgdata)
+                    else:
+                        colorspace = imgprops.ColorSpace
+                        if colorspace == PdfName.DeviceGray:
+                            colorspace = 'L'
+                        elif colorspace == PdfName.DeviceRGB:
+                            colorspace = 'RGB'
+                        elif colorspace == PdfName.DeviceCMYK:
+                            colorspace = 'CMYK'
+                        else:
+                            raise Exception("invalid colorspace")
+                        im = Image.frombytes(colorspace,
+                                             (int(imgprops.Width),
+                                              int(imgprops.Height)),
+                                             imgdata)
+                        if orig_img.mode == '1':
+                            self.assertEqual(im.tobytes(),
+                                             orig_img.convert("L").tobytes())
+                        elif orig_img.mode not in ("RGB", "L", "CMYK",
+                                                   "CMYK;I"):
+                            self.assertEqual(im.tobytes(),
+                                             orig_img.convert("RGB").tobytes())
+                        # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does
+                        # not have the close() method
+                        try:
+                            im.close()
+                        except AttributeError:
+                            pass
             # now use pdfrw to parse and then write out both pdfs and check the
             # result for equality
             y = PdfReader(out)

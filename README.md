@@ -1,64 +1,51 @@
 img2pdf
 =======
 
-Losslessly convert raster images to PDF. The file size will not unnecessarily
-increase. One major application would be a number of scans made in JPEG format
-which should now become part of a single PDF document.  Existing solutions
-would either re-encode the input JPEG files (leading to quality loss) or store
-them in the zip/flate format which results into the PDF becoming unnecessarily
-large in terms of its file size.
+Lossless conversion of raster images to PDF. You should use img2pdf if your
+priorities are (in this order):
 
-Background
-----------
+ 1. **always lossless**: the image embedded in the PDF will always have the
+    exact same color information for every pixel as the input
+ 2. **small**: if possible, the difference in filesize between the input image
+    and the output PDF will only be the overhead of the PDF container itself
+ 3. **fast**: if possible, the input image is just pasted into the PDF document
+    as-is without any CPU hungry re-encoding of the pixel data
 
-Quality loss can be avoided when converting JPEG and JPEG2000 images to PDF by
-embedding them without re-encoding.  I wrote this piece of python code.
-because I was missing a tool to do this automatically. Img2pdf basically just
-wraps JPEG images into the PDF container as they are.
+Conventional conversion software (like ImageMagick) would either:
 
-If you know an existing tool which allows one to embed JPEG and JPEG2000 images
-into a PDF container without recompression, please contact me so that I can put
-this code into the garbage bin.
+ 1. not be lossless because lossy re-encoding to JPEG
+ 2. not be small because using wasteful flate encoding of raw pixel data
+ 3. not be fast because input data gets re-encoded
 
-Functionality
--------------
+Another advantage of not having to re-encode the input (in most common
+situations) is, that img2pdf is able to handle much larger input than other
+software, because the raw pixel data never has to be loaded into memory.
 
-This program will take a list of images and produce a PDF file with the images
-embedded in it.  JPEG and JPEG2000 images will be included without
-recompression.  Raster images in other formats will be included with zip/flate
-encoding which usually leads to an increase in the resulting size because
-formats like png compress better than PDF which just zip/flate compresses the
-RGB data.  As a result, this tool is able to losslessly wrap images into a PDF
-container with a quality to filesize ratio that is typically better (in case of
-JPEG and JPEG2000 images) or equal (in case of other formats) than that of
-existing tools.
+The following table shows how img2pdf handles different input depending on the
+input file format and image color space.
 
-For example, imagemagick will re-encode the input JPEG image (thus changing
-its content):
+| Format               | Colorspace                     | Result        |
+| -------------------- | ------------------------------ | ------------- |
+| JPEG                 | any                            | direct        |
+| JPEG2000             | any                            | direct        |
+| PNG (non-interlaced) | any                            | direct        |
+| TIFF (CCITT Group 4) | monochrome                     | direct        |
+| any                  | any except CMYK and monochrome | PNG Paeth     |
+| any                  | monochrome                     | CCITT Group 4 |
+| any                  | CMYK                           | flate         |
 
-	$ convert img.jpg img.pdf
-	$ pdfimages img.pdf img.extr # not using -j to be extra sure there is no recompression
-	$ compare -metric AE img.jpg img.extr-000.ppm null:
-	1.6301e+06
+For JPEG, JPEG2000, non-interlaced PNG and TIFF images with CCITT Group 4
+encoded data, img2pdf directly embeds the image data into the PDF without
+re-encoding it. It thus treats the PDF format merely as a container format for
+the image data. In these cases, img2pdf only increases the filesize by the size
+of the PDF container (typically around 500 to 700 bytes). Since data is only
+copied and not re-encoded, img2pdf is also typically faster than other
+solutions for these input formats.
 
-If one wants to losslessly convert from any format to PDF with
-imagemagick, one has to use zip compression:
-
-	$ convert input.jpg -compress Zip output.pdf
-	$ pdfimages img.pdf img.extr # not using -j to be extra sure there is no recompression
-	$ compare -metric AE img.jpg img.extr-000.ppm null:
-	0
-
-However, this approach will result in PDF files that are a few times larger
-than the input JPEG or JPEG2000 file.
-
-img2pdf is able to losslessly embed JPEG and JPEG2000 files into a PDF
-container without additional overhead (aside from the PDF structure itself),
-save other graphics formats using lossless zip compression, and produce
-multi-page PDF files when more than one input image is given.
-
-Also, since JPEG and JPEG2000 images are not reencoded, conversion with img2pdf
-is several times faster than with other tools.
+For all other input types, img2pdf first has to transform the pixel data to
+make it compatible with PDF. In most cases, the PNG Paeth filter is applied to
+the pixel data. For monochrome input, CCITT Group 4 is used instead. Only for
+CMYK input no filter is applied before finally applying flate compression.
 
 Usage
 -----
@@ -67,66 +54,61 @@ The images must be provided as files because img2pdf needs to seek in the file
 descriptor.
 
 If no output file is specified with the `-o`/`--output` option, output will be
-done to stdout.
+done to stdout. A typical invocation is:
+
+	$ img2pdf img1.png img2.jpg -o out.pdf
 
 The detailed documentation can be accessed by running:
 
-	img2pdf --help
-
+	$ img2pdf --help
 
 Bugs
 ----
 
-If you find a JPEG or JPEG2000 file that, when embedded cannot be read
-by the Adobe Acrobat Reader, please contact me.
+ - If you find a JPEG, JPEG2000, PNG or CCITT Group 4 encoded TIFF file that,
+   when embedded into the PDF cannot be read by the Adobe Acrobat Reader,
+   please contact me.
 
-For lossless conversion of formats other than JPEG or JPEG2000, zip/flate
-encoding is used.  This choice is based on tests I did with a number of images.
-I converted them into PDF using the lossless variants of the compression
-formats offered by imagemagick.  In all my tests, zip/flate encoding performed
-best.  You can verify my findings using the test_comp.sh script with any input
-image given as a commandline argument.  If you find an input file that is
-outperformed by another lossless compression method, contact me.
+ - I have not yet figured out how to determine the colorspace of JPEG2000
+   files.  Therefore JPEG2000 files use DeviceRGB by default. For JPEG2000
+   files with other colorspaces, you must explicitly specify it using the
+   `--colorspace` option.
 
-I have not yet figured out how to determine the colorspace of JPEG2000 files.
-Therefore JPEG2000 files use DeviceRGB by default. For JPEG2000 files with
-other colorspaces, you must explicitly specify it using the `--colorspace`
-option.
+ - Input images with alpha channels are not allowed. PDF doesn't support alpha
+   channels in images and thus, the alpha channel of the input would have to be
+   discarded. But img2pdf will always be lossless and thus, input images must
+   not carry transparency information.
 
-It might be possible to store transparency using masks but it is not clear
-what the utility of such a functionality would be.
-
-Most vector graphic formats can be losslessly turned into PDF (minus some of
-the features unsupported by PDF) but img2pdf will currently turn vector
-graphics into their lossy raster representations. For converting raster
-graphics to PDF, use another tool like inkscape and then join the resulting
-pages with a tool like pdftk.
-
-A configuration file could be used for default options.
+ - img2pdf uses PIL (or Pillow) to obtain image meta data and to convert the
+   input if necessary. To prevent decompression bomb denial of service attacks,
+   Pillow limits the maximum number of pixels an input image is allowed to
+   have. If you are sure that you know what you are doing, then you can disable
+   this safeguard by passing the `--pillow-limit-break` option to img2pdf. This
+   allows one to process even very large input images.
 
 Installation
 ------------
 
-On a Debian- and Ubuntu-based systems, dependencies may be installed
-with the following command:
+On a Debian- and Ubuntu-based systems, img2pdf can be installed from the
+official repositories:
 
-	apt-get install python3 python3-pil python3-setuptools
+	$ apt install img2pdf
 
-You can then install the package using:
+If you want to install it using pip, you can run:
 
-	$ pip install img2pdf
+	$ pip3 install img2pdf
 
 If you prefer to install from source code use:
 
 	$ cd img2pdf/
-	$ pip install .
+	$ pip3 install .
 
 To test the console script without installing the package on your system,
 use virtualenv:
 
 	$ cd img2pdf/
 	$ virtualenv ve
-	$ ve/bin/pip install .
+	$ ve/bin/pip3 install .
 
 You can then test the converter using:
 
@@ -135,7 +117,102 @@ You can then test the converter using:
 The package can also be used as a library:
 
 	import img2pdf
-	pdf_bytes = img2pdf.convert('test.jpg')
 
-	file = open("name.pdf","wb")
-	file.write(pdf_bytes)
+	# opening from filename
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert('test.jpg'))
+
+	# opening from file handle
+	with open("name.pdf","wb") as f1, open("test.jpg") as f2:
+		f1.write(img2pdf.convert(f2))
+
+	# using in-memory image data
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert("\x89PNG...")
+
+	# multiple inputs (variant 1)
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert("test1.jpg", "test2.png"))
+
+	# multiple inputs (variant 2)
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(["test1.jpg", "test2.png"]))
+
+	# writing to file descriptor
+	with open("name.pdf","wb") as f1, open("test.jpg") as f2:
+		img2pdf.convert(f2, outputstream=f1)
+
+	# specify paper size (A4)
+	a4inpt = (img2pdf.mm_to_pt(210),img2pdf.mm_to_pt(297))
+	layout_fun = img2pdf.get_layout_fun(a4inpt)
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert('test.jpg', layout_fun=layout_fun))
+
+Comparison to ImageMagick
+-------------------------
+
+Create a large test image:
+
+	$ convert logo: -resize 8000x original.jpg
+
+Convert it into PDF using ImageMagick and img2pdf:
+
+	$ time img2pdf original.jpg -o img2pdf.pdf
+	$ time convert original.jpg imagemagick.pdf
+
+Notice how ImageMagick took an order of magnitude longer to do the conversion
+than img2pdf. It also used twice the memory.
+
+Now extract the image data from both PDF documents and compare it to the
+original:
+
+	$ pdfimages -all img2pdf.pdf tmp
+	$ compare -metric AE original.jpg tmp-000.jpg null:
+	0
+	$ pdfimages -all imagemagick.pdf tmp
+	$ compare -metric AE original.jpg tmp-000.jpg null:
+	118716
+
+To get lossless output with ImageMagick we can use Zip compression but that
+unnecessarily increases the size of the output:
+
+	$ convert original.jpg -compress Zip imagemagick.pdf
+	$ pdfimages -all imagemagick.pdf tmp
+	$ compare -metric AE original.jpg tmp-000.png null:
+	0
+	$ stat --format="%s %n" original.jpg img2pdf.pdf imagemagick.pdf
+	1535837 original.jpg
+	1536683 img2pdf.pdf
+	9397809 imagemagick.pdf
+
+Comparison to pdfLaTeX
+----------------------
+
+pdfLaTeX performs a lossless conversion from included images to PDF by default.
+If the input is a JPEG, then it simply embeds the JPEG into the PDF in the same
+way as img2pdf does it. But for other image formats it uses flate compression
+of the plain pixel data and thus needlessly increases the output file size:
+
+	$ convert logo: -resize 8000x original.png
+	$ cat << END > pdflatex.tex
+	\documentclass{article}
+	\usepackage{graphicx}
+	\begin{document}
+	\includegraphics{original.png}
+	\end{document}
+	END
+	$ pdflatex pdflatex.tex
+	$ stat --format="%s %n" original.png pdflatex.pdf
+	4500182 original.png
+	9318120 pdflatex.pdf
+
+Comparison to Tesseract OCR
+---------------------------
+
+Tesseract OCR comes closest to the functionality img2pdf provides. It is able
+to convert JPEG and PNG input to PDF without needlessly increasing the filesize
+and is at the same time lossless. So if your input is JPEG and PNG images, then
+you should safely be able to use Tesseract instead of img2pdf. For other input,
+Tesseract might not do a lossless conversion. For example it converts CMYK
+input to RGB and removes the alpha channel from images with transparency. For
+multipage TIFF or animated GIF, it will only convert the first frame.
