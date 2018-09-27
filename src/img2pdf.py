@@ -22,7 +22,7 @@ import sys
 import os
 import zlib
 import argparse
-from PIL import Image, TiffImagePlugin
+from PIL import Image, TiffImagePlugin, JpegImagePlugin
 from datetime import datetime
 from jp2 import parsejp2
 from enum import Enum
