@@ -6,7 +6,7 @@ import struct
 import sys
 import zlib
 from PIL import Image
-from io import StringIO, BytesIO
+from io import StringIO, BytesIO, TextIOWrapper
 
 HERE = os.path.dirname(__file__)
 
@@ -17,6 +17,51 @@ if PY3:
 else:
     PdfReaderIO = BytesIO
 
+# Recompressing the image stream makes the comparison robust against output
+# preserving changes in the zlib compress output bitstream
+# (e.g. between different zlib implementations/versions/releases).
+# Without this, some img2pdf 0.3.2 tests fail on Fedora 29/aarch64.
+# See also:
+# https://gitlab.mister-muffin.de/josch/img2pdf/issues/51
+# https://lists.fedoraproject.org/archives/list/devel@lists.fedoraproject.org/thread/R7GD4L5Z6HELCDAL2RDESWR2F3ZXHWVX/
+def recompress_last_stream(bs):
+    length_pos = bs.rindex(b'/Length')
+    li = length_pos + 8
+    lj = bs.index(b' ', li)
+    n = int(bs[li:lj])
+    stream_pos = bs.index(b'\nstream\n', lj)
+    si = stream_pos + 8
+    sj = si + n
+    startx_pos = bs.rindex(b'\nstartxref\n')
+    xi = startx_pos + 11
+    xj = bs.index(b'\n', xi)
+    m = int(bs[xi:xj])
+
+    unc_t = zlib.decompress(bs[si:sj])
+    t = zlib.compress(unc_t)
+
+    new_len = str(len(t)).encode('ascii')
+    u = (lj-li) + n
+    v = len(new_len) + len(t)
+    off = v - u
+
+    rs = (bs[:li] + new_len + bs[lj:si] + t + bs[sj:xi]
+            + str(m+off).encode('ascii') + bs[xj:])
+
+    return rs
+
+def compare_pdf(outx, outy):
+    if b'/FlateDecode' in outx:
+        x = recompress_last_stream(outx)
+        y = recompress_last_stream(outy)
+        if x != y:
+            print('original outx:\n{}\nouty:\n{}\n'.format(outx, outy), file=sys.stderr)
+            print('recompressed outx:\n{}\nouty:\n{}\n'.format(x, y), file=sys.stderr)
+            return False
+    else:
+        if outx != outy:
+            print('original outx:\n{}\nouty:\n{}\n'.format(outx, outy), file=sys.stderr)
+    return True
 
 # convert +set date:create +set date:modify -define png:exclude-chunk=time
 
@@ -433,6 +478,33 @@ def tiff_header_for_ccitt(width, height, img_size, ccitt_group=4):
         )
 
 
+class CommandLineTests(unittest.TestCase):
+    def test_main_help(self):
+        if PY3:
+            from contextlib import redirect_stdout
+            f = StringIO()
+            with redirect_stdout(f):
+                try:
+                    img2pdf.main(['img2pdf', '--help'])
+                except SystemExit:
+                    pass
+            res = f.getvalue()
+            self.assertIn('img2pdf', res)
+        else:
+            # silence output
+            sys_stdout = sys.stdout
+            sys.stdout = BytesIO()
+
+            try:
+                img2pdf.main(['img2pdf', '--help'])
+            except SystemExit:
+                # argparse does sys.exit(0) on --help
+                res = sys.stdout.getvalue()
+                self.assertIn('img2pdf', res)
+            finally:
+                sys.stdout = sys_stdout
+
+
 def test_suite():
     class TestImg2Pdf(unittest.TestCase):
         pass
@@ -642,7 +714,7 @@ def test_suite():
             ywriter.trailer = y
             xwriter.write(outx)
             ywriter.write(outy)
-            self.assertEqual(outx.getvalue(), outy.getvalue())
+            self.assertEqual(compare_pdf(outx.getvalue(), outy.getvalue()), True)
             # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does not have the
             # close() method
             try:
@@ -656,4 +728,5 @@ def test_suite():
 
     return unittest.TestSuite((
             unittest.makeSuite(TestImg2Pdf),
+            unittest.makeSuite(CommandLineTests),
             ))
