@@ -35,7 +35,7 @@ import struct
 
 PY3 = sys.version_info[0] >= 3
 
-__version__ = "0.3.3-sbx"
+__version__ = "0.3.4-sbx"
 default_dpi = 96.0
 papersizes = {
     "letter": "8.5inx11in",
