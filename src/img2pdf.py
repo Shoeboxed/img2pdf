@@ -1016,7 +1016,7 @@ def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
             if TAGS.get(tag, tag) == "Orientation":
                 # Detailed information on EXIF rotation tags:
                 # http://impulseadventure.com/photo/exif-orientation.html
-                if value == 1:
+                if value == 0 or value == 1:
                     rotation = 0
                 elif value == 6:
                     rotation = 90
