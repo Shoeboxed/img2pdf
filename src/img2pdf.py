@@ -62,7 +62,7 @@ try:
 except ImportError:
     have_pikepdf = False
 
-__version__ = "0.5.1"
+__version__ = "0.5.1-sbx"
 default_dpi = 96.0
 papersizes = {
     "letter": "8.5inx11in",
@@ -404,10 +404,6 @@ TIFFBitRevTable = [
     0x7F,
     0xFF,
 ]
-
-# workaround for certain JPEGs being identified as MPO
-# see https://github.com/python-pillow/Pillow/issues/1138
-JpegImagePlugin._getmp = lambda x: None
 
 
 class NegativeDimensionError(Exception):
@@ -1918,6 +1914,9 @@ def read_images(
                 and mpent["Attribute"]["DependentParentImageFlag"]
                 and not mpent["Attribute"]["DependentChildImageFlag"]
                 and mpent["Attribute"]["RepresentativeImageFlag"]
+                and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
+            ) or (
+                imgdata.getexif()[271] == "Apple"  # Exif 271 is "Make"
                 and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
             ):
                 num_main_frames += 1
