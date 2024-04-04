@@ -1,0 +1,42 @@
+language: python
+matrix:
+  include:
+    - name: "Ubuntu Focal"
+      dist: focal
+      addons:
+        apt:
+          packages:
+            - imagemagick
+            - libtiff-tools
+            - libimage-exiftool-perl
+            - poppler-utils
+            - netpbm
+            - ghostscript
+            - mupdf-tools
+    - name: "python 3.9 Windows"
+      os: windows
+      language: shell       # 'language: python' is an error on Travis CI Windows
+      before_install: choco install python imagemagick
+      env: PATH=/c/Python39:/c/Python39/Scripts:$PATH
+    - name: "python 3.7 MacOs"
+      os: osx
+      osx_image: xcode12.2  # pikepdf import fails with earlier versions
+      language: shell       # 'language: python' is an error on Travis CI macOS
+      cache:
+        directories:
+          - "$HOME/Library/Caches/Homebrew"
+          - "$HOME/Library/Caches/pip"
+      addons:
+        homebrew:
+          #update: true
+          packages:
+            - python3
+            - imagemagick
+      before_install:
+        - python3 -m pip install --upgrade virtualenv
+        - virtualenv -p python3 --system-site-packages "$HOME/venv"
+        - source "$HOME/venv/bin/activate"
+install: pip install tox
+script:
+  - python --version
+  - python -m tox

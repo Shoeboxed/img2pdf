@@ -1,0 +1,33 @@
+environment:
+  # For Python versions available on Appveyor, see
+  # https://www.appveyor.com/docs/windows-images-software/#python
+  matrix:
+#    - PYTHON: "C:\\Python27"
+#    - PYTHON: "C:\\Python33"
+#    - PYTHON: "C:\\Python34"
+#    - PYTHON: "C:\\Python35"
+#    - PYTHON: "C:\\Python36"
+#    - PYTHON: "C:\\Python37"
+#    - PYTHON: "C:\\Python27-x64"
+#    - PYTHON: "C:\\Python33-x64"
+#    - PYTHON: "C:\\Python34-x64"
+#    - PYTHON: "C:\\Python35-x64"
+#    - PYTHON: "C:\\Python36-x64"
+    - PYTHON: "C:\\Python37-x64"
+
+install:
+  - "%PYTHON%\\python.exe -m pip install tox wheel pyinstaller Pillow"
+
+build: off
+
+# don't run tests on windows because we don't have imagemagick
+#test_script:
+#  - "%PYTHON%\\python.exe -m tox"
+
+after_test:
+  - "%PYTHON%\\python.exe setup.py bdist_wheel"
+  - "%PYTHON%\\python.exe -m PyInstaller --clean --onefile --console --nowindowed --name img2pdf src/img2pdf.py"
+  #- "%PYTHON%\\python.exe -m PyInstaller --clean --onefile --noconsole --windowed --name img2pdf_windowed src/img2pdf.py"
+
+artifacts:
+  - path: dist\*

@@ -2,6 +2,85 @@
 CHANGES
 =======
 
+0.5.1 (2023-11-26)
+------------------
+
+ - no default ICC profile location for PDF/A-1b on Windows
+ - workaround for PNG input without dpi units but non-square dpi aspect ratio
+
+0.5.0 (2023-10-28)
+------------------
+
+ - support MIFF for 16 bit CMYK input
+ - accept pathlib.Path objects as input
+ - don't store RGB ICC profiles from bilevel or grayscale TIFF, PNG and JPEG
+ - thumbnails are no longer included by default and --include-thumbnails has to
+   be used if you want them
+ - support for pikepdf (>= 6.2.0)
+
+0.4.4 (2022-04-07)
+------------------
+
+ - --viewer-page-layout support for twopageright and twopageleft
+ - Add B and JB paper sizes
+ - support for pikepdf (>= 5.0.0) and Pillow (>= 9.1.0)
+
+0.4.3 (2021-10-24)
+------------------
+
+ - fix --viewer-initial-page (broken in last release)
+
+0.4.2 (2021-10-11)
+------------------
+
+ - add --rotation
+ - allow palette PNG images with ICC profile
+ - sort globbing result on windows
+ - convert 8-bit PNG alpha channels to /SMasks in PDF
+ - remove pdfrw from tests
+
+0.4.1 (2021-05-09)
+------------------
+
+ - support wildcards in paths on windows
+ - support MPO images
+ - fix page border computation
+ - use "img2pdf" logger instead of "root" logger
+ - add --from-file
+
+0.4.0 (2020-08-07)
+------------------
+
+ - replace --without-pdfrw by --engine=internal or --engine=pdfrw
+ - add pikepdf as additional rendering engine and add --engine=pikepdf
+ - support for creating PDF/A-1b compliant PDF using the --pdfa option
+   (this also requires the presence of an ICC profile somewhere on the system)
+ - support for images with embedded ICC profile as input
+ - rewrite tests
+    * use pytest via tox
+    * use pikepdf instead of pdfrw
+    * use imagemagick json output instead of identify -verbose
+ - format all code with black
+
+0.3.6 (2020-04-30)
+------------------
+
+ - fix tests for Fedora on arm64
+
+0.3.5 (2020-04-28)
+------------------
+
+ - remove all Python 2 support
+ - disable pdfrw by default
+
+0.3.4 (2020-04-05)
+------------------
+
+ - test.sh: replace imagemagick with custom python script to produce bit-by-bit
+   identical results on all architectures
+ - add --crop-border, --bleed-border, --trim-border and --art-border options
+ - first draft of a rudimentary tkinter gui (run with --gui)
+
 0.3.3 (2019-01-07)
 ------------------
 

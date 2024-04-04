@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2012-2014 Johannes 'josch' Schauer <j.schauer at email.de>
+# Copyright (C) 2012-2021 Johannes Schauer Marin Rodrigues <josch@mister-muffin.de>
 #
 # This program is free software: you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -22,20 +22,47 @@ import sys
 import os
 import zlib
 import argparse
-from PIL import Image, TiffImagePlugin, JpegImagePlugin
+from PIL import Image, TiffImagePlugin, GifImagePlugin, ImageCms
+
+if hasattr(GifImagePlugin, "LoadingStrategy"):
+    # Pillow 9.0.0 started emitting all frames but the first as RGB instead of
+    # P to make sure that more than 256 colors can be represented. But palette
+    # images compress far better than RGB images in PDF so we instruct Pillow
+    # to only emit RGB frames if the palette differs and return P otherwise.
+    # This works since Pillow 9.1.0.
+    GifImagePlugin.LOADING_STRATEGY = (
+        GifImagePlugin.LoadingStrategy.RGB_AFTER_DIFFERENT_PALETTE_ONLY
+    )
 
 # TiffImagePlugin.DEBUG = True
 from PIL.ExifTags import TAGS
-from datetime import datetime
-from jp2 import parsejp2
+from datetime import datetime, timezone
+import jp2
 from enum import Enum
 from io import BytesIO
 import logging
 import struct
+import platform
+import hashlib
+from itertools import chain
+import re
+import io
 
-PY3 = sys.version_info[0] >= 3
+logger = logging.getLogger(__name__)
 
-__version__ = "0.3.4-sbx"
+have_pdfrw = True
+try:
+    import pdfrw
+except ImportError:
+    have_pdfrw = False
+
+have_pikepdf = True
+try:
+    import pikepdf
+except ImportError:
+    have_pikepdf = False
+
+__version__ = "0.5.1-sbx"
 default_dpi = 96.0
 papersizes = {
     "letter": "8.5inx11in",
@@ -46,6 +73,20 @@ papersizes = {
     "a4": "210mmx297mm",
     "a5": "148mmx210mm",
     "a6": "105mmx148mm",
+    "b0": "1000mmx1414mm",
+    "b1": "707mmx1000mm",
+    "b2": "500mmx707mm",
+    "b3": "353mmx500mm",
+    "b4": "250mmx353mm",
+    "b5": "176mmx250mm",
+    "b6": "125mmx176mm",
+    "jb0": "1030mmx1456mm",
+    "jb1": "728mmx1030mm",
+    "jb2": "515mmx728mm",
+    "jb3": "364mmx515mm",
+    "jb4": "257mmx364mm",
+    "jb5": "182mmx257mm",
+    "jb6": "128mmx182mm",
     "legal": "8.5inx14in",
     "tabloid": "11inx17in",
 }
@@ -58,22 +99,44 @@ papernames = {
     "a4": "A4",
     "a5": "A5",
     "a6": "A6",
+    "b0": "B0",
+    "b1": "B1",
+    "b2": "B2",
+    "b3": "B3",
+    "b4": "B4",
+    "b5": "B5",
+    "b6": "B6",
+    "jb0": "JB0",
+    "jb1": "JB1",
+    "jb2": "JB2",
+    "jb3": "JB3",
+    "jb4": "JB4",
+    "jb5": "JB5",
+    "jb6": "JB6",
     "legal": "Legal",
     "tabloid": "Tabloid",
 }
 
+Engine = Enum("Engine", "internal pdfrw pikepdf")
+
+Rotation = Enum("Rotation", "auto none ifvalid 0 90 180 270")
 
 FitMode = Enum("FitMode", "into fill exact shrink enlarge")
 
 PageOrientation = Enum("PageOrientation", "portrait landscape")
 
-Colorspace = Enum("Colorspace", "RGB L 1 CMYK CMYK;I RGBA P other")
+Colorspace = Enum("Colorspace", "RGB RGBA L LA 1 CMYK CMYK;I P PA other")
 
-ImageFormat = Enum("ImageFormat", "JPEG JPEG2000 CCITTGroup4 PNG TIFF other")
+ImageFormat = Enum(
+    "ImageFormat", "JPEG JPEG2000 CCITTGroup4 PNG GIF TIFF MPO MIFF other"
+)
 
 PageMode = Enum("PageMode", "none outlines thumbs")
 
-PageLayout = Enum("PageLayout", "single onecolumn twocolumnright twocolumnleft")
+PageLayout = Enum(
+    "PageLayout",
+    "single onecolumn twocolumnright twocolumnleft twopageright twopageleft",
+)
 
 Magnification = Enum("Magnification", "fit fith fitbh")
 
@@ -342,10 +405,6 @@ TIFFBitRevTable = [
     0xFF,
 ]
 
-# workaround for certain JPEGs being identified as MPO
-# see https://github.com/python-pillow/Pillow/issues/1138
-JpegImagePlugin._getmp = lambda x: None
-
 
 class NegativeDimensionError(Exception):
     pass
@@ -365,6 +424,36 @@ class JpegColorspaceError(Exception):
 
 class PdfTooLargeError(Exception):
     pass
+
+
+class AlphaChannelError(Exception):
+    pass
+
+
+class ExifOrientationError(Exception):
+    pass
+
+
+# temporary change the attribute of an object using a context manager
+class temp_attr:
+    def __init__(self, obj, field, value):
+        self.obj = obj
+        self.field = field
+        self.value = value
+
+    def __enter__(self):
+        self.exists = False
+        if hasattr(self.obj, self.field):
+            self.exists = True
+            self.old_value = getattr(self.obj, self.field)
+        logger.debug(f"setting {self.obj}.{self.field} = {self.value}")
+        setattr(self.obj, self.field, self.value)
+
+    def __exit__(self, exctype, excinst, exctb):
+        if self.exists:
+            setattr(self.obj, self.field, self.old_value)
+        else:
+            delattr(self.obj, self.field)
 
 
 # without pdfrw this function is a no-op
@@ -451,6 +540,9 @@ class MyPdfDict(object):
     def __getitem__(self, key):
         return self.content[key]
 
+    def __contains__(self, key):
+        return key in self.content
+
 
 class MyPdfName:
     def __getattr__(self, name):
@@ -470,13 +562,12 @@ class MyPdfArray(list):
 
 
 class MyPdfWriter:
-    def __init__(self, version="1.3"):
+    def __init__(self):
         self.objects = []
         # create an incomplete pages object so that a /Parent entry can be
         # added to each page
         self.pages = MyPdfDict(Type=MyPdfName.Pages, Kids=[], Count=0)
         self.catalog = MyPdfDict(Pages=self.pages, Type=MyPdfName.Catalog)
-        self.version = version  # default pdf version 1.3
         self.pagearray = []
 
     def addobj(self, obj):
@@ -484,7 +575,7 @@ class MyPdfWriter:
         obj.identifier = newid
         self.objects.append(obj)
 
-    def tostream(self, info, stream):
+    def tostream(self, info, stream, version="1.3", ident=None):
         xreftable = list()
 
         # justification of the random binary garbage in the header from
@@ -501,7 +592,7 @@ class MyPdfWriter:
         #
         # the choice of binary characters is arbitrary but those four seem to
         # be used elsewhere.
-        pdfheader = ("%%PDF-%s\n" % self.version).encode("ascii")
+        pdfheader = ("%%PDF-%s\n" % version).encode("ascii")
         pdfheader += b"%\xe2\xe3\xcf\xd3\n"
         stream.write(pdfheader)
 
@@ -541,10 +632,11 @@ class MyPdfWriter:
         for x in xreftable:
             stream.write(x)
         stream.write(b"trailer\n")
-        stream.write(
-            parse({b"/Size": len(xreftable), b"/Info": info, b"/Root": self.catalog})
-            + b"\n"
-        )
+        trailer = {b"/Size": len(xreftable), b"/Info": info, b"/Root": self.catalog}
+        if ident is not None:
+            md5 = hashlib.md5(ident).hexdigest().encode("ascii")
+            trailer[b"/ID"] = b"[<%s><%s>]" % (md5, md5)
+        stream.write(parse(trailer) + b"\n")
         stream.write(b"startxref\n")
         stream.write(("%d\n" % xrefoffset).encode())
         stream.write(b"%%EOF\n")
@@ -558,54 +650,32 @@ class MyPdfWriter:
         self.addobj(page)
 
 
-if PY3:
-
-    class MyPdfString:
-        @classmethod
-        def encode(cls, string, hextype=False):
-            if hextype:
-                return (
-                    b"< "
-                    + b" ".join(("%06x" % c).encode("ascii") for c in string)
-                    + b" >"
-                )
-            else:
-                try:
-                    string = string.encode("ascii")
-                except UnicodeEncodeError:
-                    string = b"\xfe\xff" + string.encode("utf-16-be")
-                # We should probably encode more here because at least
-                # ghostscript interpretes a carriage return byte (0x0D) as a
-                # new line byte (0x0A)
-                # PDF supports: \n, \r, \t, \b and \f
-                string = string.replace(b"\\", b"\\\\")
-                string = string.replace(b"(", b"\\(")
-                string = string.replace(b")", b"\\)")
-                return b"(" + string + b")"
-
-
-else:
-
-    class MyPdfString(object):
-        @classmethod
-        def encode(cls, string, hextype=False):
-            if hextype:
-                return (
-                    b"< "
-                    + b" ".join(("%06x" % c).encode("ascii") for c in string)
-                    + b" >"
-                )
-            else:
-                # This mimics exactely to what pdfrw does.
-                string = string.replace(b"\\", b"\\\\")
-                string = string.replace(b"(", b"\\(")
-                string = string.replace(b")", b"\\)")
-                return b"(" + string + b")"
+class MyPdfString:
+    @classmethod
+    def encode(cls, string, hextype=False):
+        if hextype:
+            return (
+                b"< " + b" ".join(("%06x" % c).encode("ascii") for c in string) + b" >"
+            )
+        else:
+            try:
+                string = string.encode("ascii")
+            except UnicodeEncodeError:
+                string = b"\xfe\xff" + string.encode("utf-16-be")
+            # We should probably encode more here because at least
+            # ghostscript interpretes a carriage return byte (0x0D) as a
+            # new line byte (0x0A)
+            # PDF supports: \n, \r, \t, \b and \f
+            string = string.replace(b"\\", b"\\\\")
+            string = string.replace(b"(", b"\\(")
+            string = string.replace(b")", b"\\)")
+            return b"(" + string + b")"
 
 
 class pdfdoc(object):
     def __init__(
         self,
+        engine=Engine.internal,
         version="1.3",
         title=None,
         author=None,
@@ -623,69 +693,103 @@ class pdfdoc(object):
         fit_window=False,
         center_window=False,
         fullscreen=False,
-        with_pdfrw=True,
+        pdfa=None,
     ):
-        if with_pdfrw:
-            try:
-                from pdfrw import PdfWriter, PdfDict, PdfName, PdfString
+        if engine is None:
+            if have_pikepdf:
+                engine = Engine.pikepdf
+            elif have_pdfrw:
+                engine = Engine.pdfrw
+            else:
+                engine = Engine.internal
 
-                self.with_pdfrw = True
-            except ImportError:
-                PdfWriter = MyPdfWriter
-                PdfDict = MyPdfDict
-                PdfName = MyPdfName
-                PdfString = MyPdfString
-                self.with_pdfrw = False
-        else:
+        if engine == Engine.pikepdf:
+            PdfWriter = pikepdf.new
+            PdfDict = pikepdf.Dictionary
+            PdfName = pikepdf.Name
+        elif engine == Engine.pdfrw:
+            from pdfrw import PdfWriter, PdfDict, PdfName, PdfString
+        elif engine == Engine.internal:
             PdfWriter = MyPdfWriter
             PdfDict = MyPdfDict
             PdfName = MyPdfName
             PdfString = MyPdfString
-            self.with_pdfrw = False
-
-        now = datetime.now()
-        self.info = PdfDict(indirect=True)
-
-        def datetime_to_pdfdate(dt):
-            return dt.strftime("%Y%m%d%H%M%SZ")
-
-        if title is not None:
-            self.info[PdfName.Title] = PdfString.encode(title)
-        if author is not None:
-            self.info[PdfName.Author] = PdfString.encode(author)
-        if creator is not None:
-            self.info[PdfName.Creator] = PdfString.encode(creator)
-        if producer is not None and producer != "":
-            self.info[PdfName.Producer] = PdfString.encode(producer)
-        if creationdate is not None:
-            self.info[PdfName.CreationDate] = PdfString.encode(
-                "D:" + datetime_to_pdfdate(creationdate)
-            )
-        elif not nodate:
-            self.info[PdfName.CreationDate] = PdfString.encode(
-                "D:" + datetime_to_pdfdate(now)
-            )
-        if moddate is not None:
-            self.info[PdfName.ModDate] = PdfString.encode(
-                "D:" + datetime_to_pdfdate(moddate)
-            )
-        elif not nodate:
-            self.info[PdfName.ModDate] = PdfString.encode(
-                "D:" + datetime_to_pdfdate(now)
-            )
-        if subject is not None:
-            self.info[PdfName.Subject] = PdfString.encode(subject)
-        if keywords is not None:
-            self.info[PdfName.Keywords] = PdfString.encode(",".join(keywords))
+        else:
+            raise ValueError("unknown engine: %s" % engine)
 
         self.writer = PdfWriter()
-        self.writer.version = version
-        # this is done because pdfrw adds info, catalog and pages as the first
-        # three objects in this order
-        if not self.with_pdfrw:
-            self.writer.addobj(self.info)
-            self.writer.addobj(self.writer.catalog)
-            self.writer.addobj(self.writer.pages)
+        if engine != Engine.pikepdf:
+            self.writer.docinfo = PdfDict(indirect=True)
+
+        def datetime_to_pdfdate(dt):
+            return dt.astimezone(tz=timezone.utc).strftime("%Y%m%d%H%M%SZ")
+
+        for k in ["Title", "Author", "Creator", "Producer", "Subject"]:
+            v = locals()[k.lower()]
+            if v is None or v == "":
+                continue
+            if engine != Engine.pikepdf:
+                v = PdfString.encode(v)
+            self.writer.docinfo[getattr(PdfName, k)] = v
+
+        now = datetime.now().astimezone()
+        for k in ["CreationDate", "ModDate"]:
+            v = locals()[k.lower()]
+            if v is None and nodate:
+                continue
+            if v is None:
+                v = now
+            v = ("D:" + datetime_to_pdfdate(v)).encode("ascii")
+            if engine == Engine.internal:
+                v = b"(" + v + b")"
+            self.writer.docinfo[getattr(PdfName, k)] = v
+        if keywords is not None:
+            if engine == Engine.pikepdf:
+                self.writer.docinfo[PdfName.Keywords] = ",".join(keywords)
+            else:
+                self.writer.docinfo[PdfName.Keywords] = PdfString.encode(
+                    ",".join(keywords)
+                )
+
+        def datetime_to_xmpdate(dt):
+            return dt.astimezone(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self.xmp = b"""<?xpacket begin='\xef\xbb\xbf' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='XMP toolkit 2.9.1-13, framework 1.6'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#' xmlns:iX='http://ns.adobe.com/iX/1.0/'>
+  <rdf:Description rdf:about='' xmlns:pdf='http://ns.adobe.com/pdf/1.3/'%s/>
+  <rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
+    %s
+    %s
+  </rdf:Description>
+  <rdf:Description rdf:about='' xmlns:pdfaid='http://www.aiim.org/pdfa/ns/id/' pdfaid:part='1' pdfaid:conformance='B'/>
+</rdf:RDF>
+</x:xmpmeta>
+
+<?xpacket end='w'?>
+""" % (
+            b" pdf:Producer='%s'" % producer.encode("ascii")
+            if producer is not None
+            else b"",
+            b""
+            if creationdate is None and nodate
+            else b"<xmp:ModifyDate>%s</xmp:ModifyDate>"
+            % datetime_to_xmpdate(now if creationdate is None else creationdate).encode(
+                "ascii"
+            ),
+            b""
+            if moddate is None and nodate
+            else b"<xmp:CreateDate>%s</xmp:CreateDate>"
+            % datetime_to_xmpdate(now if moddate is None else moddate).encode("ascii"),
+        )
+
+        if engine != Engine.pikepdf:
+            # this is done because pdfrw adds info, catalog and pages as the first
+            # three objects in this order
+            if engine == Engine.internal:
+                self.writer.addobj(self.writer.docinfo)
+                self.writer.addobj(self.writer.catalog)
+                self.writer.addobj(self.writer.pages)
 
         self.panes = panes
         self.initial_page = initial_page
@@ -694,6 +798,9 @@ class pdfdoc(object):
         self.fit_window = fit_window
         self.center_window = center_window
         self.fullscreen = fullscreen
+        self.engine = engine
+        self.output_version = version
+        self.pdfa = pdfa
 
     def add_imagepage(
         self,
@@ -702,6 +809,7 @@ class pdfdoc(object):
         imgheightpx,
         imgformat,
         imgdata,
+        smaskdata,
         imgwidthpdf,
         imgheightpdf,
         imgxpdf,
@@ -713,63 +821,125 @@ class pdfdoc(object):
         inverted=False,
         depth=0,
         rotate=0,
+        cropborder=None,
+        bleedborder=None,
+        trimborder=None,
+        artborder=None,
+        iccp=None,
     ):
-        if self.with_pdfrw:
+        assert (
+            color not in [Colorspace.RGBA, Colorspace.LA]
+            or (imgformat == ImageFormat.PNG and smaskdata is not None)
+            or imgformat == ImageFormat.JPEG2000
+        )
+
+        if self.engine == Engine.pikepdf:
+            PdfArray = pikepdf.Array
+            PdfDict = pikepdf.Dictionary
+            PdfName = pikepdf.Name
+        elif self.engine == Engine.pdfrw:
             from pdfrw import PdfDict, PdfName, PdfObject, PdfString
             from pdfrw.py23_diffs import convert_load
-        else:
+        elif self.engine == Engine.internal:
             PdfDict = MyPdfDict
             PdfName = MyPdfName
             PdfObject = MyPdfObject
             PdfString = MyPdfString
             convert_load = my_convert_load
+        else:
+            raise ValueError("unknown engine: %s" % self.engine)
+        TrueObject = True if self.engine == Engine.pikepdf else PdfObject("true")
+        FalseObject = False if self.engine == Engine.pikepdf else PdfObject("false")
 
-        if color == Colorspace["1"] or color == Colorspace.L:
+        if color == Colorspace["1"] or color == Colorspace.L or color == Colorspace.LA:
             colorspace = PdfName.DeviceGray
-        elif color == Colorspace.RGB:
-            colorspace = PdfName.DeviceRGB
+        elif color == Colorspace.RGB or color == Colorspace.RGBA:
+            if color == Colorspace.RGBA and imgformat == ImageFormat.JPEG2000:
+                # there is no DeviceRGBA and for JPXDecode it is okay to have
+                # no colorspace as the pdf reader is supposed to get this info
+                # from the jpeg2000 payload itself
+                colorspace = None
+            else:
+                colorspace = PdfName.DeviceRGB
         elif color == Colorspace.CMYK or color == Colorspace["CMYK;I"]:
             colorspace = PdfName.DeviceCMYK
         elif color == Colorspace.P:
-            if self.with_pdfrw:
+            if self.engine == Engine.pdfrw:
+                # https://github.com/pmaupin/pdfrw/issues/128
+                # https://github.com/pmaupin/pdfrw/issues/147
                 raise Exception(
                     "pdfrw does not support hex strings for "
                     "palette image input, re-run with "
-                    "--without-pdfrw"
+                    "--engine=internal or --engine=pikepdf"
                 )
+            assert len(palette) % 3 == 0
             colorspace = [
                 PdfName.Indexed,
                 PdfName.DeviceRGB,
-                len(palette) - 1,
-                PdfString.encode(palette, hextype=True),
+                (len(palette) // 3) - 1,
+                bytes(palette)
+                if self.engine == Engine.pikepdf
+                else PdfString.encode(
+                    [
+                        int.from_bytes(palette[i : i + 3], "big")
+                        for i in range(0, len(palette), 3)
+                    ],
+                    hextype=True,
+                ),
             ]
         else:
             raise UnsupportedColorspaceError("unsupported color space: %s" % color.name)
+
+        if iccp is not None:
+            if self.engine == Engine.pikepdf:
+                iccpdict = self.writer.make_stream(iccp)
+            else:
+                iccpdict = PdfDict(stream=convert_load(iccp))
+            iccpdict[PdfName.Alternate] = colorspace
+            if (
+                color == Colorspace["1"]
+                or color == Colorspace.L
+                or color == Colorspace.LA
+            ):
+                iccpdict[PdfName.N] = 1
+            elif color == Colorspace.RGB or color == Colorspace.RGBA:
+                iccpdict[PdfName.N] = 3
+            elif color == Colorspace.CMYK or color == Colorspace["CMYK;I"]:
+                iccpdict[PdfName.N] = 4
+            elif color == Colorspace.P:
+                raise Exception("Cannot have Palette images with ICC profile")
+            colorspace = [PdfName.ICCBased, iccpdict]
 
         # either embed the whole jpeg or deflate the bitmap representation
         if imgformat is ImageFormat.JPEG:
             ofilter = PdfName.DCTDecode
         elif imgformat is ImageFormat.JPEG2000:
             ofilter = PdfName.JPXDecode
-            self.writer.version = "1.5"  # jpeg2000 needs pdf 1.5
+            self.output_version = "1.5"  # jpeg2000 needs pdf 1.5
         elif imgformat is ImageFormat.CCITTGroup4:
             ofilter = [PdfName.CCITTFaxDecode]
         else:
             ofilter = PdfName.FlateDecode
 
-        image = PdfDict(stream=convert_load(imgdata))
+        if self.engine == Engine.pikepdf:
+            image = self.writer.make_stream(imgdata)
+        else:
+            image = PdfDict(stream=convert_load(imgdata))
 
         image[PdfName.Type] = PdfName.XObject
         image[PdfName.Subtype] = PdfName.Image
         image[PdfName.Filter] = ofilter
         image[PdfName.Width] = imgwidthpx
         image[PdfName.Height] = imgheightpx
-        image[PdfName.ColorSpace] = colorspace
+        if colorspace is not None:
+            image[PdfName.ColorSpace] = colorspace
         image[PdfName.BitsPerComponent] = depth
+
+        smask = None
 
         if color == Colorspace["CMYK;I"]:
             # Inverts all four channels
-            image[PdfName.Decode] = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+            image[PdfName.Decode] = [1, 0, 1, 0, 1, 0, 1, 0]
 
         if imgformat is ImageFormat.CCITTGroup4:
             decodeparms = PdfDict()
@@ -777,16 +947,42 @@ class pdfdoc(object):
             # encoding. We set it to -1 because we want Group 4 encoding.
             decodeparms[PdfName.K] = -1
             if inverted:
-                decodeparms[PdfName.BlackIs1] = PdfObject("false")
+                decodeparms[PdfName.BlackIs1] = FalseObject
             else:
-                decodeparms[PdfName.BlackIs1] = PdfObject("true")
+                decodeparms[PdfName.BlackIs1] = TrueObject
             decodeparms[PdfName.Columns] = imgwidthpx
             decodeparms[PdfName.Rows] = imgheightpx
             image[PdfName.DecodeParms] = [decodeparms]
         elif imgformat is ImageFormat.PNG:
+            if smaskdata is not None:
+                if self.engine == Engine.pikepdf:
+                    smask = self.writer.make_stream(smaskdata)
+                else:
+                    smask = PdfDict(stream=convert_load(smaskdata))
+                smask[PdfName.Type] = PdfName.XObject
+                smask[PdfName.Subtype] = PdfName.Image
+                smask[PdfName.Filter] = PdfName.FlateDecode
+                smask[PdfName.Width] = imgwidthpx
+                smask[PdfName.Height] = imgheightpx
+                smask[PdfName.ColorSpace] = PdfName.DeviceGray
+                smask[PdfName.BitsPerComponent] = depth
+
+                decodeparms = PdfDict()
+                decodeparms[PdfName.Predictor] = 15
+                decodeparms[PdfName.Colors] = 1
+                decodeparms[PdfName.Columns] = imgwidthpx
+                decodeparms[PdfName.BitsPerComponent] = depth
+                smask[PdfName.DecodeParms] = decodeparms
+
+                image[PdfName.SMask] = smask
+
+                # /SMask requires PDF 1.4
+                if self.output_version < "1.4":
+                    self.output_version = "1.4"
+
             decodeparms = PdfDict()
             decodeparms[PdfName.Predictor] = 15
-            if color in [Colorspace.P, Colorspace["1"], Colorspace.L]:
+            if color in [Colorspace.P, Colorspace["1"], Colorspace.L, Colorspace.LA]:
                 decodeparms[PdfName.Colors] = 1
             else:
                 decodeparms[PdfName.Colors] = 3
@@ -799,27 +995,80 @@ class pdfdoc(object):
             % (imgwidthpdf, imgheightpdf, imgxpdf, imgypdf)
         ).encode("ascii")
 
-        content = PdfDict(stream=convert_load(text))
+        if self.engine == Engine.pikepdf:
+            content = self.writer.make_stream(text)
+        else:
+            content = PdfDict(stream=convert_load(text))
         resources = PdfDict(XObject=PdfDict(Im0=image))
 
-        page = PdfDict(indirect=True)
-        page[PdfName.Type] = PdfName.Page
-        page[PdfName.MediaBox] = [0, 0, pagewidth, pageheight]
+        if self.engine == Engine.pikepdf:
+            page = self.writer.add_blank_page(page_size=(pagewidth, pageheight))
+        else:
+            page = PdfDict(indirect=True)
+            page[PdfName.Type] = PdfName.Page
+            page[PdfName.MediaBox] = [0, 0, pagewidth, pageheight]
+        # 14.11.2 Page Boundaries
+        # ...
+        # The crop, bleed, trim, and art boxes shall not ordinarily extend
+        # beyond the boundaries of the media box. If they do, they are
+        # effectively reduced to their intersection with the media box.
+        if cropborder is not None:
+            page[PdfName.CropBox] = [
+                cropborder[1],
+                cropborder[0],
+                pagewidth - cropborder[1],
+                pageheight - cropborder[0],
+            ]
+        if bleedborder is None:
+            if PdfName.CropBox in page:
+                page[PdfName.BleedBox] = page[PdfName.CropBox]
+        else:
+            page[PdfName.BleedBox] = [
+                bleedborder[1],
+                bleedborder[0],
+                pagewidth - bleedborder[1],
+                pageheight - bleedborder[0],
+            ]
+        if trimborder is None:
+            if PdfName.CropBox in page:
+                page[PdfName.TrimBox] = page[PdfName.CropBox]
+        else:
+            page[PdfName.TrimBox] = [
+                trimborder[1],
+                trimborder[0],
+                pagewidth - trimborder[1],
+                pageheight - trimborder[0],
+            ]
+        if artborder is None:
+            if PdfName.CropBox in page:
+                page[PdfName.ArtBox] = page[PdfName.CropBox]
+        else:
+            page[PdfName.ArtBox] = [
+                artborder[1],
+                artborder[0],
+                pagewidth - artborder[1],
+                pageheight - artborder[0],
+            ]
         page[PdfName.Resources] = resources
         page[PdfName.Contents] = content
         if rotate != 0:
             page[PdfName.Rotate] = rotate
         if userunit is not None:
             # /UserUnit requires PDF 1.6
-            if self.writer.version < "1.6":
-                self.writer.version = "1.6"
+            if self.output_version < "1.6":
+                self.output_version = "1.6"
             page[PdfName.UserUnit] = userunit
 
-        self.writer.addpage(page)
+        if self.engine != Engine.pikepdf:
+            self.writer.addpage(page)
 
-        if not self.with_pdfrw:
-            self.writer.addobj(content)
-            self.writer.addobj(image)
+            if self.engine == Engine.internal:
+                self.writer.addobj(content)
+                self.writer.addobj(image)
+                if smask is not None:
+                    self.writer.addobj(smask)
+                if iccp is not None:
+                    self.writer.addobj(iccpdict)
 
     def tostring(self):
         stream = BytesIO()
@@ -827,15 +1076,23 @@ class pdfdoc(object):
         return stream.getvalue()
 
     def tostream(self, outputstream):
-        if self.with_pdfrw:
+        if self.engine == Engine.pikepdf:
+            PdfArray = pikepdf.Array
+            PdfDict = pikepdf.Dictionary
+            PdfName = pikepdf.Name
+        elif self.engine == Engine.pdfrw:
             from pdfrw import PdfDict, PdfName, PdfArray, PdfObject
-        else:
+            from pdfrw.py23_diffs import convert_load
+        elif self.engine == Engine.internal:
             PdfDict = MyPdfDict
             PdfName = MyPdfName
             PdfObject = MyPdfObject
             PdfArray = MyPdfArray
-        NullObject = PdfObject("null")
-        TrueObject = PdfObject("true")
+            convert_load = my_convert_load
+        else:
+            raise ValueError("unknown engine: %s" % self.engine)
+        NullObject = None if self.engine == Engine.pikepdf else PdfObject("null")
+        TrueObject = True if self.engine == Engine.pikepdf else PdfObject("true")
 
         # We fill the catalog with more information like /ViewerPreferences,
         # /PageMode, /PageLayout or /OpenAction because the latter refers to a
@@ -845,10 +1102,14 @@ class pdfdoc(object):
         # is added, so we can only start using it after all pages have been
         # written.
 
-        if self.with_pdfrw:
+        if self.engine == Engine.pikepdf:
+            catalog = self.writer.Root
+        elif self.engine == Engine.pdfrw:
             catalog = self.writer.trailer.Root
-        else:
+        elif self.engine == Engine.internal:
             catalog = self.writer.catalog
+        else:
+            raise ValueError("unknown engine: %s" % self.engine)
 
         if (
             self.fullscreen
@@ -904,16 +1165,34 @@ class pdfdoc(object):
         # FitBV - Fits the height of the page bounding box to the window.
 
         # by default the initial page is the first one
-        initial_page = self.writer.pagearray[0]
+        if self.engine == Engine.pikepdf:
+            initial_page = self.writer.pages[0]
+        else:
+            initial_page = self.writer.pagearray[0]
         # we set the open action here to make sure we open on the requested
         # initial page but this value might be overwritten by a custom open
         # action later while still taking the requested initial page into
         # account
         if self.initial_page is not None:
-            initial_page = self.writer.pagearray[self.initial_page - 1]
+            if self.engine == Engine.pikepdf:
+                initial_page = self.writer.pages[self.initial_page - 1]
+            else:
+                initial_page = self.writer.pagearray[self.initial_page - 1]
             catalog[PdfName.OpenAction] = PdfArray(
                 [initial_page, PdfName.XYZ, NullObject, NullObject, 0]
             )
+
+        # The /OpenAction array must contain the page as an indirect object.
+        # This changed some time after 4.2.0 and on or before 5.0.0 and current
+        # versions require to use .obj or otherwise we get:
+        #   TypeError: Can't convert ObjectHelper (or subclass) to Object
+        #   implicitly. Use .obj to get access the underlying object.
+        # See https://github.com/pikepdf/pikepdf/issues/313 for details.
+        if self.engine == Engine.pikepdf:
+            if isinstance(initial_page, pikepdf.Page):
+                initial_page = self.writer.make_indirect(initial_page.obj)
+            else:
+                initial_page = self.writer.make_indirect(initial_page)
 
         if self.magnification == Magnification.fit:
             catalog[PdfName.OpenAction] = PdfArray([initial_page, PdfName.Fit])
@@ -945,24 +1224,84 @@ class pdfdoc(object):
             catalog[PdfName.PageLayout] = PdfName.TwoColumnRight
         elif self.page_layout == PageLayout.twocolumnleft:
             catalog[PdfName.PageLayout] = PdfName.TwoColumnLeft
+        elif self.page_layout == PageLayout.twopageright:
+            catalog[PdfName.PageLayout] = PdfName.TwoPageRight
+            if self.output_version < "1.5":
+                self.output_version = "1.5"
+        elif self.page_layout == PageLayout.twopageleft:
+            catalog[PdfName.PageLayout] = PdfName.TwoPageLeft
+            if self.output_version < "1.5":
+                self.output_version = "1.5"
         elif self.page_layout is None:
             pass
         else:
             raise ValueError("unknown page layout: %s" % self.page_layout)
 
+        if self.pdfa is not None:
+            if self.engine == Engine.pikepdf:
+                metadata = self.writer.make_stream(self.xmp)
+            else:
+                metadata = PdfDict(stream=convert_load(self.xmp))
+                metadata[PdfName.Subtype] = PdfName.XML
+                metadata[PdfName.Type] = PdfName.Metadata
+            with open(self.pdfa, "rb") as f:
+                icc = f.read()
+            intents = PdfDict()
+            if self.engine == Engine.pikepdf:
+                iccstream = self.writer.make_stream(icc)
+                iccstream.stream_dict.N = 3
+            else:
+                iccstream = PdfDict(stream=convert_load(zlib.compress(icc)))
+                iccstream[PdfName.N] = 3
+                iccstream[PdfName.Filter] = PdfName.FlateDecode
+            intents[PdfName.S] = PdfName.GTS_PDFA1
+            intents[PdfName.Type] = PdfName.OutputIntent
+            intents[PdfName.OutputConditionIdentifier] = (
+                b"sRGB" if self.engine == Engine.pikepdf else b"(sRGB)"
+            )
+            intents[PdfName.DestOutputProfile] = iccstream
+            catalog[PdfName.OutputIntents] = PdfArray([intents])
+            catalog[PdfName.Metadata] = metadata
+
+            if self.engine == Engine.internal:
+                self.writer.addobj(metadata)
+                self.writer.addobj(iccstream)
+
         # now write out the PDF
-        if self.with_pdfrw:
-            self.writer.trailer.Info = self.info
+        if self.engine == Engine.pikepdf:
+            kwargs = {}
+            if pikepdf.__version__ >= "6.2.0":
+                kwargs["deterministic_id"] = True
+            self.writer.save(
+                outputstream, min_version=self.output_version, linearize=True, **kwargs
+            )
+        elif self.engine == Engine.pdfrw:
+            self.writer.trailer.Info = self.writer.docinfo
+            # setting the version attribute of the pdfrw PdfWriter object will
+            # influence the behaviour of the write() function
+            self.writer.version = self.output_version
+            if self.pdfa:
+                md5 = hashlib.md5(b"").hexdigest().encode("ascii")
+                self.writer.trailer[PdfName.ID] = PdfArray([md5, md5])
             self.writer.write(outputstream)
+        elif self.engine == Engine.internal:
+            self.writer.tostream(
+                self.writer.docinfo,
+                outputstream,
+                self.output_version,
+                None if self.pdfa is None else b"",
+            )
         else:
-            self.writer.tostream(self.info, outputstream)
+            raise ValueError("unknown engine: %s" % self.engine)
 
 
-def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
+def get_imgmetadata(
+    imgdata, imgformat, default_dpi, colorspace, rawdata=None, rotreq=None
+):
     if imgformat == ImageFormat.JPEG2000 and rawdata is not None and imgdata is None:
         # this codepath gets called if the PIL installation is not able to
         # handle JPEG2000 files
-        imgwidthpx, imgheightpx, ics, hdpi, vdpi = parsejp2(rawdata)
+        imgwidthpx, imgheightpx, ics, hdpi, vdpi, channels, bpp = jp2.parse(rawdata)
 
         if hdpi is None:
             hdpi = default_dpi
@@ -972,7 +1311,19 @@ def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
     else:
         imgwidthpx, imgheightpx = imgdata.size
 
-        ndpi = imgdata.info.get("dpi", (default_dpi, default_dpi))
+        ndpi = imgdata.info.get("dpi")
+        if ndpi is None:
+            # the PNG plugin of PIL adds the undocumented "aspect" field instead of
+            # the "dpi" field if the PNG pHYs chunk unit is not set to meters
+            if imgformat == ImageFormat.PNG and imgdata.info.get("aspect") is not None:
+                aspect = imgdata.info["aspect"]
+                # make sure not to go below the default dpi
+                if aspect[0] > aspect[1]:
+                    ndpi = (default_dpi * aspect[0] / aspect[1], default_dpi)
+                else:
+                    ndpi = (default_dpi, default_dpi * aspect[1] / aspect[0])
+            else:
+                ndpi = (default_dpi, default_dpi)
         # In python3, the returned dpi value for some tiff images will
         # not be an integer but a float. To make the behaviour of
         # img2pdf the same between python2 and python3, we convert that
@@ -981,17 +1332,26 @@ def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
         ndpi = (int(round(ndpi[0])), int(round(ndpi[1])))
         ics = imgdata.mode
 
-    if ics in ["LA", "PA", "RGBA"] or "transparency" in imgdata.info:
-        logging.warning(
-            "Image contains transparency which cannot be retained " "in PDF."
-        )
-        logging.warning("img2pdf will not perform a lossy operation.")
-        logging.warning("You can remove the alpha channel using imagemagick:")
-        logging.warning(
-            "  $ convert input.png -background white -alpha "
-            "remove -alpha off output.png"
-        )
-        raise Exception("Refusing to work on images with alpha channel")
+    # GIF and PNG files with transparency are supported
+    if imgformat in [ImageFormat.PNG, ImageFormat.GIF, ImageFormat.JPEG2000] and (
+        ics in ["RGBA", "LA"] or "transparency" in imgdata.info
+    ):
+        # Must check the IHDR chunk for the bit depth, because PIL would lossily
+        # convert 16-bit RGBA/LA images to 8-bit.
+        if imgformat == ImageFormat.PNG and rawdata is not None:
+            depth = rawdata[24]
+            if depth > 8:
+                logger.warning("Image with transparency and a bit depth of %d." % depth)
+                logger.warning("This is unsupported due to PIL limitations.")
+                logger.warning(
+                    "If you accept a lossy conversion, you can manually convert "
+                    "your images to 8 bit using `convert -depth 8` from imagemagick"
+                )
+                raise AlphaChannelError(
+                    "Refusing to work with multiple >8bit channels."
+                )
+    elif ics in ["LA", "PA", "RGBA"] or "transparency" in imgdata.info:
+        raise AlphaChannelError("This function must not be called on images with alpha")
 
     # Since commit 07a96209597c5e8dfe785c757d7051ce67a980fb or release 4.1.0
     # Pillow retrieves the DPI from EXIF if it cannot find the DPI in the JPEG
@@ -1008,37 +1368,61 @@ def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
             imgdata.tag_v2.get(TiffImagePlugin.Y_RESOLUTION, default_dpi),
         )
 
-    logging.debug("input dpi = %d x %d", *ndpi)
+    logger.debug("input dpi = %d x %d", *ndpi)
 
     rotation = 0
-    if hasattr(imgdata, "_getexif") and imgdata._getexif() is not None:
-        for tag, value in imgdata._getexif().items():
-            if TAGS.get(tag, tag) == "Orientation":
-                # Detailed information on EXIF rotation tags:
-                # http://impulseadventure.com/photo/exif-orientation.html
-                if value == 0 or value == 1:
-                    rotation = 0
-                elif value == 6:
-                    rotation = 90
-                elif value == 3:
-                    rotation = 180
-                elif value == 8:
-                    rotation = 270
-                elif value in (2, 4, 5, 7):
-                    raise Exception(
-                        'Image "%s": Unsupported flipped '
-                        "rotation mode (%d)" % (im.name, value)
-                    )
-                else:
-                    raise Exception(
-                        'Image "%s": invalid rotation (%d)' % (im.name, value)
-                    )
+    if rotreq in (None, Rotation.auto, Rotation.ifvalid):
+        if hasattr(imgdata, "_getexif") and imgdata._getexif() is not None:
+            for tag, value in imgdata._getexif().items():
+                if TAGS.get(tag, tag) == "Orientation":
+                    # Detailed information on EXIF rotation tags:
+                    # http://impulseadventure.com/photo/exif-orientation.html
+                    if value == 0 or value == 1:
+                        rotation = 0
+                    elif value == 6:
+                        rotation = 90
+                    elif value == 3:
+                        rotation = 180
+                    elif value == 8:
+                        rotation = 270
+                    elif value in (2, 4, 5, 7):
+                        if rotreq == Rotation.ifvalid:
+                            logger.warning(
+                                "Unsupported flipped rotation mode (%d): use "
+                                "--rotation=ifvalid or "
+                                "rotation=img2pdf.Rotation.ifvalid to ignore",
+                                value,
+                            )
+                        else:
+                            raise ExifOrientationError(
+                                "Unsupported flipped rotation mode (%d): use "
+                                "--rotation=ifvalid or "
+                                "rotation=img2pdf.Rotation.ifvalid to ignore" % value
+                            )
+                    else:
+                        if rotreq == Rotation.ifvalid:
+                            logger.warning("Invalid rotation (%d)", value)
+                        else:
+                            raise ExifOrientationError(
+                                "Invalid rotation (%d): use --rotation=ifvalid "
+                                "or rotation=img2pdf.Rotation.ifvalid to ignore" % value
+                            )
+    elif rotreq in (Rotation.none, Rotation["0"]):
+        rotation = 0
+    elif rotreq == Rotation["90"]:
+        rotation = 90
+    elif rotreq == Rotation["180"]:
+        rotation = 180
+    elif rotreq == Rotation["270"]:
+        rotation = 270
+    else:
+        raise Exception("invalid rotreq")
 
-    logging.debug("rotation = %d°", rotation)
+    logger.debug("rotation = %d°", rotation)
 
     if colorspace:
         color = colorspace
-        logging.debug("input colorspace (forced) = %s", color)
+        logger.debug("input colorspace (forced) = %s", color)
     else:
         color = None
         for c in Colorspace:
@@ -1068,11 +1452,62 @@ def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
             # with the first approach for now.
             if "adobe" in imgdata.info:
                 color = Colorspace["CMYK;I"]
-        logging.debug("input colorspace = %s", color.name)
+        logger.debug("input colorspace = %s", color.name)
 
-    logging.debug("width x height = %dpx x %dpx", imgwidthpx, imgheightpx)
+    iccp = None
+    if "icc_profile" in imgdata.info:
+        iccp = imgdata.info.get("icc_profile")
+    # GIMP saves bilevel TIFF images and palette PNG images with only black and
+    # white in the palette with an RGB ICC profile which is useless
+    # https://gitlab.gnome.org/GNOME/gimp/-/issues/3438
+    # and produces an error in Adobe Acrobat, so we ignore it with a warning.
+    # imagemagick also used to (wrongly) include an RGB ICC profile for bilevel
+    # images: https://github.com/ImageMagick/ImageMagick/issues/2070
+    if iccp is not None and (
+        (color == Colorspace["1"] and imgformat == ImageFormat.TIFF)
+        or (
+            imgformat == ImageFormat.PNG
+            and color == Colorspace.P
+            and rawdata is not None
+            and parse_png(rawdata)[1]
+            in [b"\x00\x00\x00\xff\xff\xff", b"\xff\xff\xff\x00\x00\x00"]
+        )
+    ):
+        with io.BytesIO(iccp) as f:
+            prf = ImageCms.ImageCmsProfile(f)
+        if (
+            prf.profile.model == "sRGB"
+            and prf.profile.manufacturer == "GIMP"
+            and prf.profile.profile_description == "GIMP built-in sRGB"
+        ):
+            if imgformat == ImageFormat.TIFF:
+                logger.warning(
+                    "Ignoring RGB ICC profile in bilevel TIFF produced by GIMP."
+                )
+            elif imgformat == ImageFormat.PNG:
+                logger.warning(
+                    "Ignoring RGB ICC profile in 2-color palette PNG produced by GIMP."
+                )
+            logger.warning("https://gitlab.gnome.org/GNOME/gimp/-/issues/3438")
+            iccp = None
+    # SmartAlbums old version (found 2.2.6) exports JPG with only 1 compone
+    # with an RGB ICC profile which is useless.
+    # This produces an error in Adobe Acrobat, so we ignore it with a warning.
+    # Update: Found another case, the JPG is created by Adobe PhotoShop, so we
+    # don't check software anymore.
+    if iccp is not None and (
+        (color == Colorspace["L"] and imgformat == ImageFormat.JPEG)
+    ):
+        with io.BytesIO(iccp) as f:
+            prf = ImageCms.ImageCmsProfile(f)
 
-    return (color, ndpi, imgwidthpx, imgheightpx, rotation)
+        if prf.profile.xcolor_space not in ("GRAY"):
+            logger.warning("Ignoring non-GRAY ICC profile in Grayscale JPG")
+            iccp = None
+
+    logger.debug("width x height = %dpx x %dpx", imgwidthpx, imgheightpx)
+
+    return (color, ndpi, imgwidthpx, imgheightpx, rotation, iccp)
 
 
 def ccitt_payload_location_from_pil(img):
@@ -1087,19 +1522,20 @@ def ccitt_payload_location_from_pil(img):
     # Read the TIFF tags to find the offset(s) of the compressed data strips.
     strip_offsets = img.tag_v2[TiffImagePlugin.STRIPOFFSETS]
     strip_bytes = img.tag_v2[TiffImagePlugin.STRIPBYTECOUNTS]
-    rows_per_strip = img.tag_v2.get(TiffImagePlugin.ROWSPERSTRIP, 2 ** 32 - 1)
 
     # PIL always seems to create a single strip even for very large TIFFs when
     # it saves images, so assume we only have to read a single strip.
     # A test ~10 GPixel image was still encoded as a single strip. Just to be
     # safe check throw an error if there is more than one offset.
     if len(strip_offsets) != 1 or len(strip_bytes) != 1:
-        raise NotImplementedError("Transcoding multiple strips not supported")
+        raise NotImplementedError(
+            "Transcoding multiple strips not supported by the PDF format"
+        )
 
     (offset,), (length,) = strip_offsets, strip_bytes
 
-    logging.debug("TIFF strip_offsets: %d" % offset)
-    logging.debug("TIFF strip_bytes: %d" % length)
+    logger.debug("TIFF strip_offsets: %d" % offset)
+    logger.debug("TIFF strip_bytes: %d" % length)
 
     return offset, length
 
@@ -1107,7 +1543,7 @@ def ccitt_payload_location_from_pil(img):
 def transcode_monochrome(imgdata):
     """Convert the open PIL.Image imgdata to compressed CCITT Group4 data"""
 
-    logging.debug("Converting monochrome to CCITT Group4")
+    logger.debug("Converting monochrome to CCITT Group4")
 
     # Convert the image to Group 4 in memory. If libtiff is not installed and
     # Pillow is not compiled against it, .save() will raise an exception.
@@ -1118,7 +1554,35 @@ def transcode_monochrome(imgdata):
     # killed by a SIGABRT:
     #   https://gitlab.mister-muffin.de/josch/img2pdf/issues/46
     im = Image.frombytes(imgdata.mode, imgdata.size, imgdata.tobytes())
-    im.save(newimgio, format="TIFF", compression="group4")
+
+    # Since version 8.3.0 Pillow limits strips to 64 KB. Since PDF only
+    # supports single strip CCITT Group4 payloads, we have to coerce it back
+    # into putting everything into a single strip. Thanks to Andrew Murray for
+    # the hack.
+    #
+    # Since version 8.4.0 Pillow allows us to modify the strip size explicitly
+    tmp_strip_size = (imgdata.size[0] + 7) // 8 * imgdata.size[1]
+    if hasattr(TiffImagePlugin, "STRIP_SIZE"):
+        # we are using Pillow 8.4.0 or later
+        with temp_attr(TiffImagePlugin, "STRIP_SIZE", tmp_strip_size):
+            im.save(newimgio, format="TIFF", compression="group4")
+    else:
+        # only needed for Pillow 8.3.x but works for versions before that as
+        # well
+        pillow__getitem__ = TiffImagePlugin.ImageFileDirectory_v2.__getitem__
+
+        def __getitem__(self, tag):
+            overrides = {
+                TiffImagePlugin.ROWSPERSTRIP: imgdata.size[1],
+                TiffImagePlugin.STRIPBYTECOUNTS: [tmp_strip_size],
+                TiffImagePlugin.STRIPOFFSETS: [0],
+            }
+            return overrides.get(tag, pillow__getitem__(self, tag))
+
+        with temp_attr(
+            TiffImagePlugin.ImageFileDirectory_v2, "__getitem__", __getitem__
+        ):
+            im.save(newimgio, format="TIFF", compression="group4")
 
     # Open new image in memory
     newimgio.seek(0)
@@ -1132,36 +1596,220 @@ def transcode_monochrome(imgdata):
 
 def parse_png(rawdata):
     pngidat = b""
-    palette = []
+    palette = b""
     i = 16
     while i < len(rawdata):
         # once we can require Python >= 3.2 we can use int.from_bytes() instead
-        n, = struct.unpack(">I", rawdata[i - 8 : i - 4])
+        (n,) = struct.unpack(">I", rawdata[i - 8 : i - 4])
         if i + n > len(rawdata):
             raise Exception("invalid png: %d %d %d" % (i, n, len(rawdata)))
         if rawdata[i - 4 : i] == b"IDAT":
             pngidat += rawdata[i : i + n]
         elif rawdata[i - 4 : i] == b"PLTE":
-            # This could be as simple as saying "palette = rawdata[i:i+n]" but
-            # pdfrw does only escape parenthesis and backslashes in the raw
-            # byte stream. But raw carriage return bytes are interpreted as
-            # line feed bytes by ghostscript. So instead we use the hex string
-            # format. pdfrw cannot write it but at least ghostscript is happy
-            # with it. We would also write out the palette in binary format
-            # (and escape more bytes) but since we cannot use pdfrw anyways,
-            # we choose the more human readable variant.
-            # See https://github.com/pmaupin/pdfrw/issues/147
-            for j in range(i, i + n, 3):
-                # with int.from_bytes() we would not have to prepend extra
-                # zeroes
-                color, = struct.unpack(">I", b"\x00" + rawdata[j : j + 3])
-                palette.append(color)
+            palette += rawdata[i : i + n]
         i += n
         i += 12
     return pngidat, palette
 
 
-def read_images(rawdata, colorspace, first_frame_only=False):
+miff_re = re.compile(
+    r"""
+    [^\x00-\x20\x7f-\x9f] # the field name must not start with a control char or space
+    [^=]+                 # the field name can even contain spaces
+    =                     # field name and value are separated by an equal sign
+    (?:
+        [^\x00-\x20\x7f-\x9f{}] # either chars that are not braces and not control chars
+        |{[^}]*}                # or any kind of char surrounded by braces
+    )+""",
+    re.VERBOSE,
+)
+
+# https://imagemagick.org/script/miff.php
+# turn off black formatting until python 3.10 is available on more platforms
+# and we can use match/case
+# fmt: off
+def parse_miff(data):
+    results = []
+    header, rest = data.split(b":\x1a", 1)
+    header = header.decode("ISO-8859-1")
+    assert header.lower().startswith("id=imagemagick")
+    hdata = {}
+    for i, line in enumerate(re.findall(miff_re, header)):
+        if not line:
+            continue
+        k, v = line.split("=", 1)
+        if i == 0:
+            assert k.lower() == "id"
+            assert v.lower() == "imagemagick"
+        #match k.lower():
+        #    case "class":
+        if k.lower() == "class":
+                #match v:
+                #    case "DirectClass" | "PseudoClass":
+                if v in ["DirectClass", "PseudoClass"]:
+                        hdata["class"] = v
+                #    case _:
+                else:
+                        print("cannot understand class", v)
+        #    case "colorspace":
+        elif k.lower() == "colorspace":
+                # theoretically RGBA and CMYKA should be supported as well
+                # please teach me how to create such a MIFF file
+                #match v:
+                #    case "sRGB" | "CMYK" | "Gray":
+                if v in ["sRGB", "CMYK", "Gray"]:
+                        hdata["colorspace"] = v
+                #    case _:
+                else:
+                        print("cannot understand colorspace", v)
+        #    case "depth":
+        elif k.lower() == "depth":
+                #match v:
+                #    case "8" | "16" | "32":
+                if v in ["8", "16", "32"]:
+                        hdata["depth"] = int(v)
+                #    case _:
+                else:
+                        print("cannot understand depth", v)
+        #    case "colors":
+        elif k.lower() == "colors":
+                hdata["colors"] = int(v)
+        #    case "matte":
+        elif k.lower() == "matte":
+                #match v:
+                #    case "True":
+                if v == "True":
+                        hdata["matte"] = True
+                #    case "False":
+                elif v == "False":
+                        hdata["matte"] = False
+                #    case _:
+                else:
+                        print("cannot understand matte", v)
+        #    case "columns" | "rows":
+        elif k.lower() in ["columns", "rows"]:
+                hdata[k.lower()] = int(v)
+        #    case "compression":
+        elif k.lower() == "compression":
+                print("compression not yet supported")
+        #    case "profile":
+        elif k.lower() == "profile":
+                assert v in ["icc", "exif"]
+                hdata["profile"] = v
+        #    case "resolution":
+        elif k.lower() == "resolution":
+                dpix, dpiy = v.split("x", 1)
+                hdata["resolution"] = (float(dpix), float(dpiy))
+
+    assert "depth" in hdata
+    assert "columns" in hdata
+    assert "rows" in hdata
+    #match hdata["class"]:
+    #    case "DirectClass":
+    if hdata["class"] == "DirectClass":
+            if "colors" in hdata:
+                assert hdata["colors"] == 0
+            #match hdata["colorspace"]:
+            #    case "sRGB":
+            if hdata["colorspace"] == "sRGB":
+                    numchannels = 3
+                    colorspace = Colorspace.RGB
+            #    case "CMYK":
+            elif hdata["colorspace"] == "CMYK":
+                    numchannels = 4
+                    colorspace = Colorspace.CMYK
+            #    case "Gray":
+            elif hdata["colorspace"] == "Gray":
+                    numchannels = 1
+                    colorspace = Colorspace.L
+            if hdata.get("matte"):
+                numchannels += 1
+            if hdata.get("profile"):
+                # there is no key encoding the length of icc or exif data
+                # according to the docs, the profile-icc key is supposed to do this
+                print("FAIL: exif")
+            else:
+                lenimgdata = (
+                    hdata["depth"] // 8 * numchannels * hdata["columns"] * hdata["rows"]
+                )
+                assert len(rest) >= lenimgdata, (
+                    len(rest),
+                    hdata["depth"],
+                    numchannels,
+                    hdata["columns"],
+                    hdata["rows"],
+                    lenimgdata,
+                )
+                if colorspace == Colorspace.RGB and hdata["depth"] == 8:
+                    newimg = Image.frombytes("RGB", (hdata["columns"], hdata["rows"]), rest[:lenimgdata])
+                    imgdata, palette, depth = to_png_data(newimg)
+                    assert palette == b""
+                    assert depth == hdata["depth"]
+                    imgfmt = ImageFormat.PNG
+                else:
+                    imgdata = zlib.compress(rest[:lenimgdata])
+                    imgfmt = ImageFormat.MIFF
+                results.append(
+                    (
+                        colorspace,
+                        hdata.get("resolution") or (default_dpi, default_dpi),
+                        imgfmt,
+                        imgdata,
+                        None,  # smask
+                        hdata["columns"],
+                        hdata["rows"],
+                        [],  # palette
+                        False,  # inverted
+                        hdata["depth"],
+                        0,  # rotation
+                        None,  # icc profile
+                    )
+                )
+                if len(rest) > lenimgdata:
+                    # another image is here
+                    assert rest[lenimgdata:][:14].lower() == b"id=imagemagick"
+                    results.extend(parse_miff(rest[lenimgdata:]))
+    #    case "PseudoClass":
+    elif hdata["class"] == "PseudoClass":
+            assert "colors" in hdata
+            if hdata.get("matte"):
+                numchannels = 2
+            else:
+                numchannels = 1
+            lenpal = 3 * hdata["colors"] * hdata["depth"] // 8
+            lenimgdata = numchannels * hdata["rows"] * hdata["columns"]
+            assert len(rest) >= lenpal + lenimgdata, (len(rest), lenpal, lenimgdata)
+            results.append(
+                (
+                    Colorspace.RGB,
+                    hdata.get("resolution") or (default_dpi, default_dpi),
+                    ImageFormat.MIFF,
+                    zlib.compress(rest[lenpal : lenpal + lenimgdata]),
+                    None,  # FIXME: allow alpha channel smask
+                    hdata["columns"],
+                    hdata["rows"],
+                    rest[:lenpal],  # palette
+                    False,  # inverted
+                    hdata["depth"],
+                    0,  # rotation
+                    None,  # icc profile
+                )
+            )
+            if len(rest) > lenpal + lenimgdata:
+                # another image is here
+                assert rest[lenpal + lenimgdata :][:14].lower() == b"id=imagemagick", (
+                    len(rest),
+                    lenpal,
+                    lenimgdata,
+                )
+                results.extend(parse_miff(rest[lenpal + lenimgdata :]))
+    return results
+# fmt: on
+
+
+def read_images(
+    rawdata, colorspace, first_frame_only=False, rot=None, include_thumbnails=False
+):
     im = BytesIO(rawdata)
     im.seek(0)
     imgdata = None
@@ -1169,14 +1817,21 @@ def read_images(rawdata, colorspace, first_frame_only=False):
         imgdata = Image.open(im)
     except IOError as e:
         # test if it is a jpeg2000 image
-        if rawdata[:12] != b"\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0A":
+        if rawdata[:12] == b"\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0A":
+            # image is jpeg2000
+            imgformat = ImageFormat.JPEG2000
+        if rawdata[:14].lower() == b"id=imagemagick":
+            # image is in MIFF format
+            # this is useful for 16 bit CMYK because PNG cannot do CMYK and thus
+            # we need PIL but PIL cannot do 16 bit
+            imgformat = ImageFormat.MIFF
+        else:
             raise ImageOpenError(
                 "cannot read input image (not jpeg2000). "
                 "PIL: error reading image: %s" % e
             )
-        # image is jpeg2000
-        imgformat = ImageFormat.JPEG2000
     else:
+        logger.debug("PIL format = %s", imgdata.format)
         imgformat = None
         for f in ImageFormat:
             if f.name == imgdata.format:
@@ -1184,38 +1839,187 @@ def read_images(rawdata, colorspace, first_frame_only=False):
         if imgformat is None:
             imgformat = ImageFormat.other
 
-    logging.debug("imgformat = %s", imgformat.name)
+    def cleanup():
+        if imgdata is not None:
+            # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does not have the
+            # close() method
+            try:
+                imgdata.close()
+            except AttributeError:
+                pass
+        im.close()
+
+    logger.debug("imgformat = %s", imgformat.name)
 
     # depending on the input format, determine whether to pass the raw
     # image or the zlib compressed color information
 
     # JPEG and JPEG2000 can be embedded into the PDF as-is
     if imgformat == ImageFormat.JPEG or imgformat == ImageFormat.JPEG2000:
-        color, ndpi, imgwidthpx, imgheightpx, rotation = get_imgmetadata(
-            imgdata, imgformat, default_dpi, colorspace, rawdata
+        color, ndpi, imgwidthpx, imgheightpx, rotation, iccp = get_imgmetadata(
+            imgdata, imgformat, default_dpi, colorspace, rawdata, rot
         )
         if color == Colorspace["1"]:
             raise JpegColorspaceError("jpeg can't be monochrome")
         if color == Colorspace["P"]:
             raise JpegColorspaceError("jpeg can't have a color palette")
-        if color == Colorspace["RGBA"]:
+        if color == Colorspace["RGBA"] and imgformat != ImageFormat.JPEG2000:
             raise JpegColorspaceError("jpeg can't have an alpha channel")
-        im.close()
-        logging.debug("read_images() embeds a JPEG")
+        logger.debug("read_images() embeds a JPEG")
+        cleanup()
+        depth = 8
+        if imgformat == ImageFormat.JPEG2000:
+            *_, depth = jp2.parse(rawdata)
         return [
             (
                 color,
                 ndpi,
                 imgformat,
                 rawdata,
+                None,
                 imgwidthpx,
                 imgheightpx,
                 [],
                 False,
-                8,
+                depth,
                 rotation,
+                iccp,
             )
         ]
+
+    # The MPO format is multiple JPEG images concatenated together
+    # we use the offset and size information to dissect the MPO into its
+    # individual JPEG images and then embed those into the PDF individually.
+    #
+    # The downside is, that this truncates the first JPEG as the MPO metadata
+    # will still be in it but the referenced images are chopped off. We still
+    # do it that way instead of adding the full MPO as the first image to not
+    # store duplicate image data.
+    if imgformat == ImageFormat.MPO:
+        result = []
+        img_page_count = 0
+        assert len(imgdata._MpoImageFile__mpoffsets) == len(imgdata.mpinfo[0xB002])
+        num_frames = len(imgdata.mpinfo[0xB002])
+        # An MPO file can be a main image together with one or more thumbnails
+        # if that is the case, then we only include all frames if the
+        # --include-thumbnails option is given. If it is not, such an MPO file
+        # will be embedded as is, so including its thumbnails but showing up
+        # as a single image page in the resulting PDF.
+        num_main_frames = 0
+        num_thumbnail_frames = 0
+        for i, mpent in enumerate(imgdata.mpinfo[0xB002]):
+            # check only the first frame for being the main image
+            if (
+                i == 0
+                and mpent["Attribute"]["DependentParentImageFlag"]
+                and not mpent["Attribute"]["DependentChildImageFlag"]
+                and mpent["Attribute"]["RepresentativeImageFlag"]
+                and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
+            ) or (
+                imgdata.getexif()[271] == "Apple"  # Exif 271 is "Make"
+                and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
+            ):
+                num_main_frames += 1
+            elif (
+                not mpent["Attribute"]["DependentParentImageFlag"]
+                and mpent["Attribute"]["DependentChildImageFlag"]
+                and not mpent["Attribute"]["RepresentativeImageFlag"]
+                and mpent["Attribute"]["MPType"]
+                in [
+                    "Large Thumbnail (VGA Equivalent)",
+                    "Large Thumbnail (Full HD Equivalent)",
+                ]
+            ):
+                num_thumbnail_frames += 1
+        logger.debug(f"number of frames: {num_frames}")
+        logger.debug(f"number of main frames: {num_main_frames}")
+        logger.debug(f"number of thumbnail frames: {num_thumbnail_frames}")
+        # this MPO file is a main image plus zero or more thumbnails
+        # embed as-is unless the --include-thumbnails option was given
+        if num_frames == 1 or (
+            not include_thumbnails
+            and num_main_frames == 1
+            and num_thumbnail_frames + 1 == num_frames
+        ):
+            color, ndpi, imgwidthpx, imgheightpx, rotation, iccp = get_imgmetadata(
+                imgdata, imgformat, default_dpi, colorspace, rawdata, rot
+            )
+            if color == Colorspace["1"]:
+                raise JpegColorspaceError("jpeg can't be monochrome")
+            if color == Colorspace["P"]:
+                raise JpegColorspaceError("jpeg can't have a color palette")
+            if color == Colorspace["RGBA"]:
+                raise JpegColorspaceError("jpeg can't have an alpha channel")
+            logger.debug("read_images() embeds an MPO verbatim")
+            cleanup()
+            return [
+                (
+                    color,
+                    ndpi,
+                    ImageFormat.JPEG,
+                    rawdata,
+                    None,
+                    imgwidthpx,
+                    imgheightpx,
+                    [],
+                    False,
+                    8,
+                    rotation,
+                    iccp,
+                )
+            ]
+        # If the control flow reaches here, the MPO has more than a single
+        # frame but was not detected to be a main image followed by multiple
+        # thumbnails. We thus treat this MPO as we do other multi-frame images
+        # and include all its frames as individual pages.
+        for offset, mpent in zip(
+            imgdata._MpoImageFile__mpoffsets, imgdata.mpinfo[0xB002]
+        ):
+            if first_frame_only and img_page_count > 0:
+                break
+            with BytesIO(rawdata[offset : offset + mpent["Size"]]) as rawframe:
+                with Image.open(rawframe) as imframe:
+                    # The first frame contains the data that makes the JPEG a MPO
+                    # Could we thus embed an MPO into another MPO? Lets not support
+                    # such madness ;)
+                    if img_page_count > 0 and imframe.format != "JPEG":
+                        raise Exception("MPO payload must be a JPEG %s", imframe.format)
+                    (
+                        color,
+                        ndpi,
+                        imgwidthpx,
+                        imgheightpx,
+                        rotation,
+                        iccp,
+                    ) = get_imgmetadata(
+                        imframe, ImageFormat.JPEG, default_dpi, colorspace, rotreq=rot
+                    )
+            if color == Colorspace["1"]:
+                raise JpegColorspaceError("jpeg can't be monochrome")
+            if color == Colorspace["P"]:
+                raise JpegColorspaceError("jpeg can't have a color palette")
+            if color == Colorspace["RGBA"]:
+                raise JpegColorspaceError("jpeg can't have an alpha channel")
+            logger.debug("read_images() embeds a JPEG from MPO")
+            result.append(
+                (
+                    color,
+                    ndpi,
+                    ImageFormat.JPEG,
+                    rawdata[offset : offset + mpent["Size"]],
+                    None,
+                    imgwidthpx,
+                    imgheightpx,
+                    [],
+                    False,
+                    8,
+                    rotation,
+                    iccp,
+                )
+            )
+            img_page_count += 1
+        cleanup()
+        return result
 
     # We can directly embed the IDAT chunk of PNG images if the PNG is not
     # interlaced
@@ -1225,33 +2029,48 @@ def read_images(rawdata, colorspace, first_frame_only=False):
     # IHDR chunk. We know where to find that in the file because the IHDR chunk
     # must be the first chunk.
     if imgformat == ImageFormat.PNG and rawdata[28] == 0:
-        color, ndpi, imgwidthpx, imgheightpx, rotation = get_imgmetadata(
-            imgdata, imgformat, default_dpi, colorspace, rawdata
+        color, ndpi, imgwidthpx, imgheightpx, rotation, iccp = get_imgmetadata(
+            imgdata, imgformat, default_dpi, colorspace, rawdata, rot
         )
-        pngidat, palette = parse_png(rawdata)
-        im.close()
-        # PIL does not provide the information about the original bits per
-        # sample. Thus, we retrieve that info manually by looking at byte 9 in
-        # the IHDR chunk. We know where to find that in the file because the
-        # IHDR chunk must be the first chunk
-        depth = rawdata[24]
-        if depth not in [1, 2, 4, 8, 16]:
-            raise ValueError("invalid bit depth: %d" % depth)
-        logging.debug("read_images() embeds a PNG")
-        return [
-            (
-                color,
-                ndpi,
-                imgformat,
-                pngidat,
-                imgwidthpx,
-                imgheightpx,
-                palette,
-                False,
-                depth,
-                rotation,
-            )
-        ]
+        if (
+            color != Colorspace.RGBA
+            and color != Colorspace.LA
+            and color != Colorspace.PA
+            and "transparency" not in imgdata.info
+        ):
+            pngidat, palette = parse_png(rawdata)
+            # PIL does not provide the information about the original bits per
+            # sample. Thus, we retrieve that info manually by looking at byte 9 in
+            # the IHDR chunk. We know where to find that in the file because the
+            # IHDR chunk must be the first chunk
+            depth = rawdata[24]
+            if depth not in [1, 2, 4, 8, 16]:
+                raise ValueError("invalid bit depth: %d" % depth)
+            # we embed the PNG only if it is not at the same time palette based
+            # and has an icc profile because PDF doesn't support icc profiles
+            # on palette images
+            if palette == b"" or iccp is None:
+                logger.debug("read_images() embeds a PNG")
+                cleanup()
+                return [
+                    (
+                        color,
+                        ndpi,
+                        imgformat,
+                        pngidat,
+                        None,
+                        imgwidthpx,
+                        imgheightpx,
+                        palette,
+                        False,
+                        depth,
+                        rotation,
+                        iccp,
+                    )
+                ]
+
+    if imgformat == ImageFormat.MIFF:
+        return parse_miff(rawdata)
 
     # If our input is not JPEG or PNG, then we might have a format that
     # supports multiple frames (like TIFF or GIF), so we need a loop to
@@ -1296,6 +2115,7 @@ def read_images(rawdata, colorspace, first_frame_only=False):
             imgformat == ImageFormat.TIFF
             and imgdata.info["compression"] == "group4"
             and len(imgdata.tag_v2[TiffImagePlugin.STRIPOFFSETS]) == 1
+            and len(imgdata.tag_v2[TiffImagePlugin.STRIPBYTECOUNTS]) == 1
         ):
             photo = imgdata.tag_v2[TiffImagePlugin.PHOTOMETRIC_INTERPRETATION]
             inverted = False
@@ -1306,8 +2126,8 @@ def read_images(rawdata, colorspace, first_frame_only=False):
                     "unsupported photometric interpretation for "
                     "group4 tiff: %d" % photo
                 )
-            color, ndpi, imgwidthpx, imgheightpx, rotation = get_imgmetadata(
-                imgdata, imgformat, default_dpi, colorspace, rawdata
+            color, ndpi, imgwidthpx, imgheightpx, rotation, iccp = get_imgmetadata(
+                imgdata, imgformat, default_dpi, colorspace, rawdata, rot
             )
             offset, length = ccitt_payload_location_from_pil(imgdata)
             im.seek(offset)
@@ -1320,7 +2140,7 @@ def read_images(rawdata, colorspace, first_frame_only=False):
                 # msb-to-lsb: nothing to do
                 pass
             elif fillorder == 2:
-                logging.debug("fillorder is lsb-to-msb => reverse bits")
+                logger.debug("fillorder is lsb-to-msb => reverse bits")
                 # lsb-to-msb: reverse bits of each byte
                 rawdata = bytearray(rawdata)
                 for i in range(len(rawdata)):
@@ -1328,64 +2148,70 @@ def read_images(rawdata, colorspace, first_frame_only=False):
                 rawdata = bytes(rawdata)
             else:
                 raise ValueError("unsupported FillOrder: %d" % fillorder)
-            logging.debug("read_images() embeds Group4 from TIFF")
+            logger.debug("read_images() embeds Group4 from TIFF")
             result.append(
                 (
                     color,
                     ndpi,
                     ImageFormat.CCITTGroup4,
                     rawdata,
+                    None,
                     imgwidthpx,
                     imgheightpx,
                     [],
                     inverted,
                     1,
                     rotation,
+                    iccp,
                 )
             )
             img_page_count += 1
             continue
 
-        logging.debug("Converting frame: %d" % img_page_count)
+        logger.debug("Converting frame: %d" % img_page_count)
 
-        color, ndpi, imgwidthpx, imgheightpx, rotation = get_imgmetadata(
-            imgdata, imgformat, default_dpi, colorspace
+        color, ndpi, imgwidthpx, imgheightpx, rotation, iccp = get_imgmetadata(
+            imgdata, imgformat, default_dpi, colorspace, rotreq=rot
         )
 
         newimg = None
         if color == Colorspace["1"]:
             try:
                 ccittdata = transcode_monochrome(imgdata)
-                logging.debug("read_images() encoded a B/W image as CCITT group 4")
+                logger.debug("read_images() encoded a B/W image as CCITT group 4")
                 result.append(
                     (
                         color,
                         ndpi,
                         ImageFormat.CCITTGroup4,
                         ccittdata,
+                        None,
                         imgwidthpx,
                         imgheightpx,
                         [],
                         False,
                         1,
                         rotation,
+                        iccp,
                     )
                 )
                 img_page_count += 1
                 continue
             except Exception as e:
-                logging.debug(e)
-                logging.debug("Converting colorspace 1 to L")
+                logger.debug(e)
+                logger.debug("Converting colorspace 1 to L")
                 newimg = imgdata.convert("L")
                 color = Colorspace.L
         elif color in [
             Colorspace.RGB,
+            Colorspace.RGBA,
             Colorspace.L,
+            Colorspace.LA,
             Colorspace.CMYK,
             Colorspace["CMYK;I"],
             Colorspace.P,
         ]:
-            logging.debug("Colorspace is OK: %s", color)
+            logger.debug("Colorspace is OK: %s", color)
             newimg = imgdata
         else:
             raise ValueError("unknown or unsupported colorspace: %s" % color.name)
@@ -1393,60 +2219,106 @@ def read_images(rawdata, colorspace, first_frame_only=False):
         # compression
         if color in [Colorspace.CMYK, Colorspace["CMYK;I"]]:
             imggz = zlib.compress(newimg.tobytes())
-            logging.debug("read_images() encoded CMYK with flate compression")
+            logger.debug("read_images() encoded CMYK with flate compression")
             result.append(
                 (
                     color,
                     ndpi,
                     imgformat,
                     imggz,
+                    None,
                     imgwidthpx,
                     imgheightpx,
                     [],
                     False,
                     8,
                     rotation,
+                    iccp,
                 )
             )
         else:
-            # cheapo version to retrieve a PNG encoding of the payload is to
-            # just save it with PIL. In the future this could be replaced by
-            # dedicated function applying the Paeth PNG filter to the raw pixel
-            pngbuffer = BytesIO()
-            newimg.save(pngbuffer, format="png")
-            pngidat, palette = parse_png(pngbuffer.getvalue())
-            # PIL does not provide the information about the original bits per
-            # sample. Thus, we retrieve that info manually by looking at byte 9 in
-            # the IHDR chunk. We know where to find that in the file because the
-            # IHDR chunk must be the first chunk
-            pngbuffer.seek(24)
-            depth = ord(pngbuffer.read(1))
-            if depth not in [1, 2, 4, 8, 16]:
-                raise ValueError("invalid bit depth: %d" % depth)
-            logging.debug("read_images() encoded an image as PNG")
+            if color in [Colorspace.P, Colorspace.PA] and iccp is not None:
+                # PDF does not support palette images with icc profile
+                if color == Colorspace.P:
+                    newcolor = Colorspace.RGB
+                    newimg = newimg.convert(mode="RGB")
+                elif color == Colorspace.PA:
+                    newcolor = Colorspace.RGBA
+                    newimg = newimg.convert(mode="RGBA")
+                smaskidat = None
+            elif (
+                color == Colorspace.RGBA
+                or color == Colorspace.LA
+                or color == Colorspace.PA
+                or "transparency" in newimg.info
+            ):
+                if color == Colorspace.RGBA:
+                    newcolor = color
+                    r, g, b, a = newimg.split()
+                    newimg = Image.merge("RGB", (r, g, b))
+                elif color == Colorspace.LA:
+                    newcolor = color
+                    l, a = newimg.split()
+                    newimg = l
+                elif color == Colorspace.PA or (
+                    color == Colorspace.P and "transparency" in newimg.info
+                ):
+                    newcolor = color
+                    a = newimg.convert(mode="RGBA").split()[-1]
+                else:
+                    newcolor = Colorspace.RGBA
+                    r, g, b, a = newimg.convert(mode="RGBA").split()
+                    newimg = Image.merge("RGB", (r, g, b))
+
+                smaskidat, *_ = to_png_data(a)
+                logger.warning(
+                    "Image contains an alpha channel. Computing a separate "
+                    "soft mask (/SMask) image to store transparency in PDF."
+                )
+            else:
+                newcolor = color
+                smaskidat = None
+
+            pngidat, palette, depth = to_png_data(newimg)
+            logger.debug("read_images() encoded an image as PNG")
             result.append(
                 (
-                    color,
+                    newcolor,
                     ndpi,
                     ImageFormat.PNG,
                     pngidat,
+                    smaskidat,
                     imgwidthpx,
                     imgheightpx,
                     palette,
                     False,
                     depth,
                     rotation,
+                    iccp,
                 )
             )
         img_page_count += 1
-    # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does not have the
-    # close() method
-    try:
-        imgdata.close()
-    except AttributeError:
-        pass
-    im.close()
+    cleanup()
     return result
+
+
+def to_png_data(img):
+    # cheapo version to retrieve a PNG encoding of the payload is to
+    # just save it with PIL. In the future this could be replaced by
+    # dedicated function applying the Paeth PNG filter to the raw pixel
+    pngbuffer = BytesIO()
+    img.save(pngbuffer, format="png")
+
+    pngidat, palette = parse_png(pngbuffer.getvalue())
+    # PIL does not provide the information about the original bits per
+    # sample. Thus, we retrieve that info manually by looking at byte 9 in
+    # the IHDR chunk. We know where to find that in the file because the
+    # IHDR chunk must be the first chunk
+    pngbuffer.seek(24)
+    depth = ord(pngbuffer.read(1))
+    if depth not in [1, 2, 4, 8, 16]:
+        raise ValueError("invalid bit depth: %d" % depth)
+    return pngidat, palette, depth
 
 
 # converts a length in pixels to a length in PDF units (1/72 of an inch)
@@ -1483,14 +2355,14 @@ def get_layout_fun(
             and fitheight < 0
         ):
             raise ValueError(
-                "cannot fit into a rectangle where both " "dimensions are negative"
+                "cannot fit into a rectangle where both dimensions are negative"
             )
         elif fit not in [FitMode.fill, FitMode.enlarge] and (
             (fitwidth is not None and fitwidth < 0)
             or (fitheight is not None and fitheight < 0)
         ):
             raise Exception(
-                "cannot fit into a rectangle where either " "dimensions are negative"
+                "cannot fit into a rectangle where either dimensions are negative"
             )
 
         def default():
@@ -1723,7 +2595,11 @@ def get_fixed_dpi_layout_fun(fixed_dpi):
 
 def find_scale(pagewidth, pageheight):
     """Find the power of 10 (10, 100, 1000...) that will reduce the scale
-    below the PDF specification limit of 14400 PDF units (=200 inches)"""
+    below the PDF specification limit of 14400 PDF units (=200 inches).
+    In principle we could also choose a scale that is not a power of 10.
+    We use powers of 10 because numbers in the PDF format are represented
+    in base-10 and using powers of 10 will thus just shift the comma and
+    keep the numbers easily readable by humans as well."""
     from math import log10, ceil
 
     major = max(pagewidth, pageheight)
@@ -1740,8 +2616,8 @@ def find_scale(pagewidth, pageheight):
 # as a binary string representing the image content or as filenames to the
 # images.
 def convert(*images, **kwargs):
-
     _default_kwargs = dict(
+        engine=None,
         title=None,
         author=None,
         creator=None,
@@ -1760,16 +2636,23 @@ def convert(*images, **kwargs):
         viewer_fit_window=False,
         viewer_center_window=False,
         viewer_fullscreen=False,
-        with_pdfrw=True,
         outputstream=None,
         first_frame_only=False,
         allow_oversized=True,
+        cropborder=None,
+        bleedborder=None,
+        trimborder=None,
+        artborder=None,
+        pdfa=None,
+        rotation=None,
+        include_thumbnails=False,
     )
     for kwname, default in _default_kwargs.items():
         if kwname not in kwargs:
             kwargs[kwname] = default
 
     pdf = pdfdoc(
+        kwargs["engine"],
         "1.3",
         kwargs["title"],
         kwargs["author"],
@@ -1787,7 +2670,7 @@ def convert(*images, **kwargs):
         kwargs["viewer_fit_window"],
         kwargs["viewer_center_window"],
         kwargs["viewer_fullscreen"],
-        kwargs["with_pdfrw"],
+        kwargs["pdfa"],
     )
 
     # backwards compatibility with older img2pdf versions where the first
@@ -1799,46 +2682,72 @@ def convert(*images, **kwargs):
 
     if not isinstance(images, (list, tuple)):
         images = [images]
+    else:
+        if len(images) == 0:
+            raise ValueError("Unable to process empty list")
 
     for img in images:
         # img is allowed to be a path, a binary string representing image data
         # or a file-like object (really anything that implements read())
-        try:
-            rawdata = img.read()
-        except AttributeError:
+        # or a pathlib.Path object (really anything that implements read_bytes())
+        rawdata = None
+        for fun in "read", "read_bytes":
+            try:
+                rawdata = getattr(img, fun)()
+            except AttributeError:
+                pass
+        if rawdata is None:
             if not isinstance(img, (str, bytes)):
-                raise TypeError("Neither implements read() nor is str or bytes")
+                raise TypeError("Neither read(), read_bytes() nor is str or bytes")
             # the thing doesn't have a read() function, so try if we can treat
             # it as a file name
             try:
-                with open(img, "rb") as f:
-                    rawdata = f.read()
+                f = open(img, "rb")
             except Exception:
                 # whatever the exception is (string could contain NUL
                 # characters or the path could just not exist) it's not a file
                 # name so we now try treating it as raw image content
                 rawdata = img
+            else:
+                # we are not using a "with" block here because we only want to
+                # catch exceptions thrown by open(). The read() may throw its
+                # own exceptions like MemoryError which should be handled
+                # differently.
+                rawdata = f.read()
+                f.close()
+
+        # md5 = hashlib.md5(rawdata).hexdigest()
+        # with open("./testdata/" + md5, "wb") as f:
+        #    f.write(rawdata)
 
         for (
             color,
             ndpi,
             imgformat,
             imgdata,
+            smaskdata,
             imgwidthpx,
             imgheightpx,
             palette,
             inverted,
             depth,
             rotation,
-        ) in read_images(rawdata, kwargs["colorspace"], kwargs["first_frame_only"]):
+            iccp,
+        ) in read_images(
+            rawdata,
+            kwargs["colorspace"],
+            kwargs["first_frame_only"],
+            kwargs["rotation"],
+            kwargs["include_thumbnails"],
+        ):
             pagewidth, pageheight, imgwidthpdf, imgheightpdf = kwargs["layout_fun"](
                 imgwidthpx, imgheightpx, ndpi
             )
 
             userunit = None
             if pagewidth < 3.00 or pageheight < 3.00:
-                logging.warning(
-                    "pdf width or height is below 3.00 - too " "small for some viewers!"
+                logger.warning(
+                    "pdf width or height is below 3.00 - too small for some viewers!"
                 )
             elif pagewidth > 14400.0 or pageheight > 14400.0:
                 if kwargs["allow_oversized"]:
@@ -1851,6 +2760,17 @@ def convert(*images, **kwargs):
                     raise PdfTooLargeError(
                         "pdf width or height must not exceed 200 inches."
                     )
+            for border in ["crop", "bleed", "trim", "art"]:
+                if kwargs[border + "border"] is None:
+                    continue
+                if pagewidth < 2 * kwargs[border + "border"][1]:
+                    raise ValueError(
+                        "horizontal %s border larger than page width" % border
+                    )
+                if pageheight < 2 * kwargs[border + "border"][0]:
+                    raise ValueError(
+                        "vertical %s border larger than page height" % border
+                    )
             # the image is always centered on the page
             imgxpdf = (pagewidth - imgwidthpdf) / 2.0
             imgypdf = (pageheight - imgheightpdf) / 2.0
@@ -1860,6 +2780,7 @@ def convert(*images, **kwargs):
                 imgheightpx,
                 imgformat,
                 imgdata,
+                smaskdata,
                 imgwidthpdf,
                 imgheightpdf,
                 imgxpdf,
@@ -1871,6 +2792,11 @@ def convert(*images, **kwargs):
                 inverted,
                 depth,
                 rotation,
+                kwargs["cropborder"],
+                kwargs["bleedborder"],
+                kwargs["trimborder"],
+                kwargs["artborder"],
+                iccp,
             )
 
     if kwargs["outputstream"]:
@@ -1910,6 +2836,9 @@ def parse_num(num, name):
         except ValueError:
             msg = "%s is not a floating point number: %s" % (name, num)
             raise argparse.ArgumentTypeError(msg)
+    if num < 0:
+        msg = "%s must not be negative: %s" % (name, num)
+        raise argparse.ArgumentTypeError(msg)
     if unit == Unit.cm:
         num = cm_to_pt(num)
     elif unit == Unit.mm:
@@ -1992,7 +2921,7 @@ def parse_pagesize_rectarg(string):
     if transposed:
         w, h = h, w
     if w is None and h is None:
-        raise argparse.ArgumentTypeError("at least one dimension must be " "specified")
+        raise argparse.ArgumentTypeError("at least one dimension must be specified")
     return w, h
 
 
@@ -2014,7 +2943,7 @@ def parse_imgsize_rectarg(string):
     if transposed:
         w, h = h, w
     if w is None and h is None:
-        raise argparse.ArgumentTypeError("at least one dimension must be " "specified")
+        raise argparse.ArgumentTypeError("at least one dimension must be specified")
     return w, h
 
 
@@ -2024,7 +2953,17 @@ def parse_colorspacearg(string):
             return c
     allowed = ", ".join([c.name for c in Colorspace])
     raise argparse.ArgumentTypeError(
-        "Unsupported colorspace: %s. Must be one " "of: %s." % (string, allowed)
+        "Unsupported colorspace: %s. Must be one of: %s." % (string, allowed)
+    )
+
+
+def parse_enginearg(string):
+    for c in Engine:
+        if c.name == string:
+            return c
+    allowed = ", ".join([c.name for c in Engine])
+    raise argparse.ArgumentTypeError(
+        "Unsupported engine: %s. Must be one of: %s." % (string, allowed)
     )
 
 
@@ -2045,17 +2984,48 @@ def parse_borderarg(string):
     return h, v
 
 
-def input_images(path):
+def from_file(path):
+    result = []
     if path == "-":
-        # we slurp in all data from stdin because we need to seek in it later
-        if PY3:
-            result = sys.stdin.buffer.read()
-        else:
-            result = sys.stdin.read()
-        if len(result) == 0:
-            raise argparse.ArgumentTypeError('"%s" is empty' % path)
+        content = sys.stdin.buffer.read()
     else:
-        if PY3:
+        with open(path, "rb") as f:
+            content = f.read()
+    for path in content.split(b"\0"):
+        if path == b"":
+            continue
+        try:
+            # test-read a byte from it so that we can abort early in case
+            # we cannot read data from the file
+            with open(path, "rb") as im:
+                im.read(1)
+        except IsADirectoryError:
+            raise argparse.ArgumentTypeError('"%s" is a directory' % path)
+        except PermissionError:
+            raise argparse.ArgumentTypeError('"%s" permission denied' % path)
+        except FileNotFoundError:
+            raise argparse.ArgumentTypeError('"%s" does not exist' % path)
+        result.append(path)
+    return result
+
+
+def input_images(path_expr):
+    if path_expr == "-":
+        # we slurp in all data from stdin because we need to seek in it later
+        result = [sys.stdin.buffer.read()]
+        if len(result) == 0:
+            raise argparse.ArgumentTypeError('"%s" is empty' % path_expr)
+    else:
+        result = []
+        paths = [path_expr]
+        if sys.platform == "win32" and ("*" in path_expr or "?" in path_expr):
+            # on windows, program is responsible for expanding wildcards such as *.jpg
+            # glob won't return files that don't exist so we only use it for wildcards
+            # paths without wildcards that do not exist will trigger "does not exist"
+            from glob import glob
+
+            paths = sorted(glob(path_expr))
+        for path in paths:
             try:
                 if os.path.getsize(path) == 0:
                     raise argparse.ArgumentTypeError('"%s" is empty' % path)
@@ -2069,20 +3039,15 @@ def input_images(path):
                 raise argparse.ArgumentTypeError('"%s" permission denied' % path)
             except FileNotFoundError:
                 raise argparse.ArgumentTypeError('"%s" does not exist' % path)
-        else:
-            try:
-                if os.path.getsize(path) == 0:
-                    raise argparse.ArgumentTypeError('"%s" is empty' % path)
-                # test-read a byte from it so that we can abort early in case
-                # we cannot read data from the file
-                with open(path, "rb") as im:
-                    im.read(1)
-            except IOError as err:
-                raise argparse.ArgumentTypeError(str(err))
-            except OSError as err:
-                raise argparse.ArgumentTypeError(str(err))
-        result = path
+            result.append(path)
     return result
+
+
+def parse_rotationarg(string):
+    for m in Rotation:
+        if m.name == string.lower():
+            return m
+    raise argparse.ArgumentTypeError("unknown rotation value: %s" % string)
 
 
 def parse_fitarg(string):
@@ -2098,7 +3063,7 @@ def parse_panes(string):
             return m
     allowed = ", ".join([m.name for m in PageMode])
     raise argparse.ArgumentTypeError(
-        "Unsupported page mode: %s. Must be one " "of: %s." % (string, allowed)
+        "Unsupported page mode: %s. Must be one of: %s." % (string, allowed)
     )
 
 
@@ -2123,7 +3088,7 @@ def parse_layout(string):
             return l
     allowed = ", ".join([l.name for l in PageLayout])
     raise argparse.ArgumentTypeError(
-        "Unsupported page layout: %s. Must be " "one of: %s." % (string, allowed)
+        "Unsupported page layout: %s. Must be one of: %s." % (string, allowed)
     )
 
 
@@ -2149,7 +3114,7 @@ def valid_date(string):
     else:
         try:
             return parser.parse(string)
-        except TypeError:
+        except:
             pass
     # as a last resort, try the local date utility
     try:
@@ -2162,11 +3127,737 @@ def valid_date(string):
         except subprocess.CalledProcessError:
             pass
         else:
-            return datetime.utcfromtimestamp(int(utime))
+            return datetime.fromtimestamp(int(utime))
     raise argparse.ArgumentTypeError("cannot parse date: %s" % string)
 
 
-def main(argv=sys.argv):
+def gui():
+    import tkinter
+    import tkinter.filedialog
+
+    have_fitz = True
+    try:
+        import fitz
+    except ImportError:
+        have_fitz = False
+
+    # from Python 3.7 Lib/idlelib/configdialog.py
+    # Copyright 2015-2017 Terry Jan Reedy
+    # Python License
+    class VerticalScrolledFrame(tkinter.Frame):
+        """A pure Tkinter vertically scrollable frame.
+
+        * Use the 'interior' attribute to place widgets inside the scrollable frame
+        * Construct and pack/place/grid normally
+        * This frame only allows vertical scrolling
+        """
+
+        def __init__(self, parent, *args, **kw):
+            tkinter.Frame.__init__(self, parent, *args, **kw)
+
+            # Create a canvas object and a vertical scrollbar for scrolling it.
+            vscrollbar = tkinter.Scrollbar(self, orient=tkinter.VERTICAL)
+            vscrollbar.pack(fill=tkinter.Y, side=tkinter.RIGHT, expand=tkinter.FALSE)
+            canvas = tkinter.Canvas(
+                self,
+                borderwidth=0,
+                highlightthickness=0,
+                yscrollcommand=vscrollbar.set,
+                width=240,
+            )
+            canvas.pack(side=tkinter.LEFT, fill=tkinter.BOTH, expand=tkinter.TRUE)
+            vscrollbar.config(command=canvas.yview)
+
+            # Reset the view.
+            canvas.xview_moveto(0)
+            canvas.yview_moveto(0)
+
+            # Create a frame inside the canvas which will be scrolled with it.
+            self.interior = interior = tkinter.Frame(canvas)
+            interior_id = canvas.create_window(0, 0, window=interior, anchor=tkinter.NW)
+
+            # Track changes to the canvas and frame width and sync them,
+            # also updating the scrollbar.
+            def _configure_interior(event):
+                # Update the scrollbars to match the size of the inner frame.
+                size = (interior.winfo_reqwidth(), interior.winfo_reqheight())
+                canvas.config(scrollregion="0 0 %s %s" % size)
+
+            interior.bind("<Configure>", _configure_interior)
+
+            def _configure_canvas(event):
+                if interior.winfo_reqwidth() != canvas.winfo_width():
+                    # Update the inner frame's width to fill the canvas.
+                    canvas.itemconfigure(interior_id, width=canvas.winfo_width())
+
+            canvas.bind("<Configure>", _configure_canvas)
+
+            return
+
+    # From Python 3.7 Lib/tkinter/__init__.py
+    # Copyright 2000 Fredrik Lundh
+    # Python License
+    #
+    # add support for 'state' and 'name' kwargs
+    # add support for updating list of options
+    class OptionMenu(tkinter.Menubutton):
+        """OptionMenu which allows the user to select a value from a menu."""
+
+        def __init__(self, master, variable, value, *values, **kwargs):
+            """Construct an optionmenu widget with the parent MASTER, with
+            the resource textvariable set to VARIABLE, the initially selected
+            value VALUE, the other menu values VALUES and an additional
+            keyword argument command."""
+            kw = {
+                "borderwidth": 2,
+                "textvariable": variable,
+                "indicatoron": 1,
+                "relief": tkinter.RAISED,
+                "anchor": "c",
+                "highlightthickness": 2,
+            }
+            if "state" in kwargs:
+                kw["state"] = kwargs["state"]
+                del kwargs["state"]
+            if "name" in kwargs:
+                kw["name"] = kwargs["name"]
+                del kwargs["name"]
+            tkinter.Widget.__init__(self, master, "menubutton", kw)
+            self.widgetName = "tk_optionMenu"
+            self.callback = kwargs.get("command")
+            self.variable = variable
+            if "command" in kwargs:
+                del kwargs["command"]
+            if kwargs:
+                raise tkinter.TclError("unknown option -" + list(kwargs.keys())[0])
+            self.set_values([value] + list(values))
+
+        def __getitem__(self, name):
+            if name == "menu":
+                return self.__menu
+            return tkinter.Widget.__getitem__(self, name)
+
+        def set_values(self, values):
+            menu = self.__menu = tkinter.Menu(self, name="menu", tearoff=0)
+            self.menuname = menu._w
+            for v in values:
+                menu.add_command(
+                    label=v, command=tkinter._setit(self.variable, v, self.callback)
+                )
+            self["menu"] = menu
+
+        def destroy(self):
+            """Destroy this widget and the associated menu."""
+            tkinter.Menubutton.destroy(self)
+            self.__menu = None
+
+    root = tkinter.Tk()
+    app = tkinter.Frame(master=root)
+
+    infiles = []
+    maxpagewidth = 0
+    maxpageheight = 0
+    doc = None
+
+    args = {
+        "engine": tkinter.StringVar(),
+        "auto_orient": tkinter.BooleanVar(),
+        "fit": tkinter.StringVar(),
+        "title": tkinter.StringVar(),
+        "author": tkinter.StringVar(),
+        "creator": tkinter.StringVar(),
+        "producer": tkinter.StringVar(),
+        "subject": tkinter.StringVar(),
+        "keywords": tkinter.StringVar(),
+        "nodate": tkinter.BooleanVar(),
+        "creationdate": tkinter.StringVar(),
+        "moddate": tkinter.StringVar(),
+        "viewer_panes": tkinter.StringVar(),
+        "viewer_initial_page": tkinter.IntVar(),
+        "viewer_magnification": tkinter.StringVar(),
+        "viewer_page_layout": tkinter.StringVar(),
+        "viewer_fit_window": tkinter.BooleanVar(),
+        "viewer_center_window": tkinter.BooleanVar(),
+        "viewer_fullscreen": tkinter.BooleanVar(),
+        "pagesize_dropdown": tkinter.StringVar(),
+        "pagesize_width": tkinter.DoubleVar(),
+        "pagesize_height": tkinter.DoubleVar(),
+        "imgsize_dropdown": tkinter.StringVar(),
+        "imgsize_width": tkinter.DoubleVar(),
+        "imgsize_height": tkinter.DoubleVar(),
+        "colorspace": tkinter.StringVar(),
+        "first_frame_only": tkinter.BooleanVar(),
+    }
+    args["engine"].set("auto")
+    args["title"].set("")
+    args["auto_orient"].set(False)
+    args["fit"].set("into")
+    args["colorspace"].set("auto")
+    args["viewer_panes"].set("auto")
+    args["viewer_initial_page"].set(1)
+    args["viewer_magnification"].set("auto")
+    args["viewer_page_layout"].set("auto")
+    args["first_frame_only"].set(False)
+    args["pagesize_dropdown"].set("auto")
+    args["imgsize_dropdown"].set("auto")
+
+    def on_open_button():
+        nonlocal infiles
+        nonlocal doc
+        nonlocal maxpagewidth
+        nonlocal maxpageheight
+        infiles = tkinter.filedialog.askopenfilenames(
+            parent=root,
+            title="open image",
+            filetypes=[
+                (
+                    "images",
+                    "*.bmp *.eps *.gif *.ico *.jpeg *.jpg *.jp2 *.pcx *.png *.ppm *.tiff",
+                ),
+                ("all files", "*"),
+            ],
+            # initialdir="/home/josch/git/plakativ",
+            # initialfile="test.pdf",
+        )
+        if have_fitz:
+            with BytesIO() as f:
+                save_pdf(f)
+                f.seek(0)
+                doc = fitz.open(stream=f, filetype="pdf")
+            for page in doc:
+                if page.getDisplayList().rect.width > maxpagewidth:
+                    maxpagewidth = page.getDisplayList().rect.width
+                if page.getDisplayList().rect.height > maxpageheight:
+                    maxpageheight = page.getDisplayList().rect.height
+        draw()
+
+    def save_pdf(stream):
+        pagesizearg = None
+        if args["pagesize_dropdown"].get() == "auto":
+            # nothing to do
+            pass
+        elif args["pagesize_dropdown"].get() == "custom":
+            pagesizearg = args["pagesize_width"].get(), args["pagesize_height"].get()
+        elif args["pagesize_dropdown"].get() in papernames.values():
+            raise NotImplemented()
+        else:
+            raise Exception("no such pagesize: %s" % args["pagesize_dropdown"].get())
+        imgsizearg = None
+        if args["imgsize_dropdown"].get() == "auto":
+            # nothing to do
+            pass
+        elif args["imgsize_dropdown"].get() == "custom":
+            imgsizearg = args["imgsize_width"].get(), args["imgsize_height"].get()
+        elif args["imgsize_dropdown"].get() in papernames.values():
+            raise NotImplemented()
+        else:
+            raise Exception("no such imgsize: %s" % args["imgsize_dropdown"].get())
+        borderarg = None
+        layout_fun = get_layout_fun(
+            pagesizearg,
+            imgsizearg,
+            borderarg,
+            args["fit"].get(),
+            args["auto_orient"].get(),
+        )
+        viewer_panesarg = None
+        if args["viewer_panes"].get() == "auto":
+            # nothing to do
+            pass
+        elif args["viewer_panes"].get() in PageMode:
+            viewer_panesarg = args["viewer_panes"].get()
+        else:
+            raise Exception("no such viewer_panes: %s" % args["viewer_panes"].get())
+        viewer_magnificationarg = None
+        if args["viewer_magnification"].get() == "auto":
+            # nothing to do
+            pass
+        elif args["viewer_magnification"].get() in Magnification:
+            viewer_magnificationarg = args["viewer_magnification"].get()
+        else:
+            raise Exception(
+                "no such viewer_magnification: %s" % args["viewer_magnification"].get()
+            )
+        viewer_page_layoutarg = None
+        if args["viewer_page_layout"].get() == "auto":
+            # nothing to do
+            pass
+        elif args["viewer_page_layout"].get() in PageLayout:
+            viewer_page_layoutarg = args["viewer_page_layout"].get()
+        else:
+            raise Exception(
+                "no such viewer_page_layout: %s" % args["viewer_page_layout"].get()
+            )
+        colorspacearg = None
+        if args["colorspace"].get() != "auto":
+            colorspacearg = next(
+                v for v in Colorspace if v.name == args["colorspace"].get()
+            )
+        enginearg = None
+        if args["engine"].get() != "auto":
+            enginearg = next(v for v in Engine if v.name == args["engine"].get())
+
+        convert(
+            *infiles,
+            engine=enginearg,
+            title=args["title"].get() if args["title"].get() else None,
+            author=args["author"].get() if args["author"].get() else None,
+            creator=args["creator"].get() if args["creator"].get() else None,
+            producer=args["producer"].get() if args["producer"].get() else None,
+            creationdate=args["creationdate"].get()
+            if args["creationdate"].get()
+            else None,
+            moddate=args["moddate"].get() if args["moddate"].get() else None,
+            subject=args["subject"].get() if args["subject"].get() else None,
+            keywords=args["keywords"].get() if args["keywords"].get() else None,
+            colorspace=colorspacearg,
+            nodate=args["nodate"].get(),
+            layout_fun=layout_fun,
+            viewer_panes=viewer_panesarg,
+            viewer_initial_page=args["viewer_initial_page"].get()
+            if args["viewer_initial_page"].get() > 1
+            else None,
+            viewer_magnification=viewer_magnificationarg,
+            viewer_page_layout=viewer_page_layoutarg,
+            viewer_fit_window=(args["viewer_fit_window"].get() or None),
+            viewer_center_window=(args["viewer_center_window"].get() or None),
+            viewer_fullscreen=(args["viewer_fullscreen"].get() or None),
+            outputstream=stream,
+            first_frame_only=args["first_frame_only"].get(),
+            cropborder=None,
+            bleedborder=None,
+            trimborder=None,
+            artborder=None,
+        )
+
+    def on_save_button():
+        filename = tkinter.filedialog.asksaveasfilename(
+            parent=root,
+            title="save PDF",
+            defaultextension=".pdf",
+            filetypes=[("pdf documents", "*.pdf"), ("all files", "*")],
+            # initialdir="/home/josch/git/plakativ",
+            # initialfile=base + "_poster" + ext,
+        )
+        with open(filename, "wb") as f:
+            save_pdf(f)
+
+    root.title("img2pdf")
+    app.pack(fill=tkinter.BOTH, expand=tkinter.TRUE)
+
+    canvas = tkinter.Canvas(app, bg="black")
+
+    def draw():
+        canvas.delete(tkinter.ALL)
+        if not infiles:
+            canvas.create_text(
+                canvas.size[0] / 2,
+                canvas.size[1] / 2,
+                text='Click on the "Open Image(s)" button in the upper right.',
+                fill="white",
+            )
+            return
+
+        if not doc:
+            canvas.create_text(
+                canvas.size[0] / 2,
+                canvas.size[1] / 2,
+                text="PyMuPDF not available. Install the Python fitz module\n"
+                + "for preview functionality.",
+                fill="white",
+            )
+            return
+
+        canvas_padding = 10
+        # factor to convert from pdf dimensions (given in pt) into canvas
+        # dimensions (given in pixels)
+        zoom = min(
+            (canvas.size[0] - canvas_padding) / maxpagewidth,
+            (canvas.size[1] - canvas_padding) / maxpageheight,
+        )
+
+        pagenum = 0
+        mat_0 = fitz.Matrix(zoom, zoom)
+        canvas.image = tkinter.PhotoImage(
+            data=doc[pagenum]
+            .getDisplayList()
+            .getPixmap(matrix=mat_0, alpha=False)
+            .getImageData("ppm")
+        )
+        canvas.create_image(
+            (canvas.size[0] - maxpagewidth * zoom) / 2,
+            (canvas.size[1] - maxpageheight * zoom) / 2,
+            anchor=tkinter.NW,
+            image=canvas.image,
+        )
+
+        canvas.create_rectangle(
+            (canvas.size[0] - maxpagewidth * zoom) / 2,
+            (canvas.size[1] - maxpageheight * zoom) / 2,
+            (canvas.size[0] - maxpagewidth * zoom) / 2 + canvas.image.width(),
+            (canvas.size[1] - maxpageheight * zoom) / 2 + canvas.image.height(),
+            outline="red",
+        )
+
+    def on_resize(event):
+        canvas.size = (event.width, event.height)
+        draw()
+
+    canvas.pack(fill=tkinter.BOTH, side=tkinter.LEFT, expand=tkinter.TRUE)
+    canvas.bind("<Configure>", on_resize)
+
+    frame_right = tkinter.Frame(app)
+    frame_right.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.Y)
+
+    top_frame = tkinter.Frame(frame_right)
+    top_frame.pack(fill=tkinter.X)
+
+    tkinter.Button(top_frame, text="Open Image(s)", command=on_open_button).pack(
+        side=tkinter.LEFT, expand=tkinter.TRUE, fill=tkinter.X
+    )
+    tkinter.Button(top_frame, text="Help", state=tkinter.DISABLED).pack(
+        side=tkinter.RIGHT, expand=tkinter.TRUE, fill=tkinter.X
+    )
+
+    frame1 = VerticalScrolledFrame(frame_right)
+    frame1.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.Y)
+
+    output_options = tkinter.LabelFrame(frame1.interior, text="Output Options")
+    output_options.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    tkinter.Label(output_options, text="colorspace").grid(
+        row=0, column=0, sticky=tkinter.W
+    )
+    OptionMenu(output_options, args["colorspace"], "auto", state=tkinter.DISABLED).grid(
+        row=0, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(output_options, text="engine").grid(row=1, column=0, sticky=tkinter.W)
+    OptionMenu(output_options, args["engine"], "auto", state=tkinter.DISABLED).grid(
+        row=1, column=1, sticky=tkinter.W
+    )
+    tkinter.Checkbutton(
+        output_options,
+        text="Suppress timestamp",
+        variable=args["nodate"],
+        state=tkinter.DISABLED,
+    ).grid(row=2, column=0, columnspan=2, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        output_options,
+        text="only first frame",
+        variable=args["first_frame_only"],
+        state=tkinter.DISABLED,
+    ).grid(row=3, column=0, columnspan=2, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        output_options, text="force large input", state=tkinter.DISABLED
+    ).grid(row=4, column=0, columnspan=2, sticky=tkinter.W)
+    image_size_frame = tkinter.LabelFrame(frame1.interior, text="Image size")
+    image_size_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    OptionMenu(
+        image_size_frame,
+        args["imgsize_dropdown"],
+        *(["auto", "custom"] + sorted(papernames.values())),
+        state=tkinter.DISABLED,
+    ).grid(row=1, column=0, columnspan=3, sticky=tkinter.W)
+
+    tkinter.Label(
+        image_size_frame, text="Width:", state=tkinter.DISABLED, name="size_label_width"
+    ).grid(row=2, column=0, sticky=tkinter.W)
+    tkinter.Spinbox(
+        image_size_frame,
+        format="%.2f",
+        increment=0.01,
+        from_=0,
+        to=100,
+        width=5,
+        state=tkinter.DISABLED,
+        name="spinbox_width",
+    ).grid(row=2, column=1, sticky=tkinter.W)
+    tkinter.Label(
+        image_size_frame, text="mm", state=tkinter.DISABLED, name="size_label_width_mm"
+    ).grid(row=2, column=2, sticky=tkinter.W)
+
+    tkinter.Label(
+        image_size_frame,
+        text="Height:",
+        state=tkinter.DISABLED,
+        name="size_label_height",
+    ).grid(row=3, column=0, sticky=tkinter.W)
+    tkinter.Spinbox(
+        image_size_frame,
+        format="%.2f",
+        increment=0.01,
+        from_=0,
+        to=100,
+        width=5,
+        state=tkinter.DISABLED,
+        name="spinbox_height",
+    ).grid(row=3, column=1, sticky=tkinter.W)
+    tkinter.Label(
+        image_size_frame, text="mm", state=tkinter.DISABLED, name="size_label_height_mm"
+    ).grid(row=3, column=2, sticky=tkinter.W)
+
+    page_size_frame = tkinter.LabelFrame(frame1.interior, text="Page size")
+    page_size_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    OptionMenu(
+        page_size_frame,
+        args["pagesize_dropdown"],
+        *(["auto", "custom"] + sorted(papernames.values())),
+        state=tkinter.DISABLED,
+    ).grid(row=1, column=0, columnspan=3, sticky=tkinter.W)
+
+    tkinter.Label(
+        page_size_frame, text="Width:", state=tkinter.DISABLED, name="size_label_width"
+    ).grid(row=2, column=0, sticky=tkinter.W)
+    tkinter.Spinbox(
+        page_size_frame,
+        format="%.2f",
+        increment=0.01,
+        from_=0,
+        to=100,
+        width=5,
+        state=tkinter.DISABLED,
+        name="spinbox_width",
+    ).grid(row=2, column=1, sticky=tkinter.W)
+    tkinter.Label(
+        page_size_frame, text="mm", state=tkinter.DISABLED, name="size_label_width_mm"
+    ).grid(row=2, column=2, sticky=tkinter.W)
+
+    tkinter.Label(
+        page_size_frame,
+        text="Height:",
+        state=tkinter.DISABLED,
+        name="size_label_height",
+    ).grid(row=3, column=0, sticky=tkinter.W)
+    tkinter.Spinbox(
+        page_size_frame,
+        format="%.2f",
+        increment=0.01,
+        from_=0,
+        to=100,
+        width=5,
+        state=tkinter.DISABLED,
+        name="spinbox_height",
+    ).grid(row=3, column=1, sticky=tkinter.W)
+    tkinter.Label(
+        page_size_frame, text="mm", state=tkinter.DISABLED, name="size_label_height_mm"
+    ).grid(row=3, column=2, sticky=tkinter.W)
+    layout_frame = tkinter.LabelFrame(frame1.interior, text="Layout")
+    layout_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    tkinter.Label(layout_frame, text="border", state=tkinter.DISABLED).grid(
+        row=0, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(layout_frame, state=tkinter.DISABLED).grid(
+        row=0, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(layout_frame, text="fit", state=tkinter.DISABLED).grid(
+        row=1, column=0, sticky=tkinter.W
+    )
+    OptionMenu(
+        layout_frame, args["fit"], *[v.name for v in FitMode], state=tkinter.DISABLED
+    ).grid(row=1, column=1, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        layout_frame,
+        text="auto orient",
+        state=tkinter.DISABLED,
+        variable=args["auto_orient"],
+    ).grid(row=2, column=0, columnspan=2, sticky=tkinter.W)
+    tkinter.Label(layout_frame, text="crop border", state=tkinter.DISABLED).grid(
+        row=3, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(layout_frame, state=tkinter.DISABLED).grid(
+        row=3, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(layout_frame, text="bleed border", state=tkinter.DISABLED).grid(
+        row=4, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(layout_frame, state=tkinter.DISABLED).grid(
+        row=4, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(layout_frame, text="trim border", state=tkinter.DISABLED).grid(
+        row=5, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(layout_frame, state=tkinter.DISABLED).grid(
+        row=5, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(layout_frame, text="art border", state=tkinter.DISABLED).grid(
+        row=6, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(layout_frame, state=tkinter.DISABLED).grid(
+        row=6, column=1, sticky=tkinter.W
+    )
+    metadata_frame = tkinter.LabelFrame(frame1.interior, text="PDF metadata")
+    metadata_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    tkinter.Label(metadata_frame, text="title", state=tkinter.DISABLED).grid(
+        row=0, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(
+        metadata_frame, textvariable=args["title"], state=tkinter.DISABLED
+    ).grid(row=0, column=1, sticky=tkinter.W)
+    tkinter.Label(metadata_frame, text="author", state=tkinter.DISABLED).grid(
+        row=1, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(
+        metadata_frame, textvariable=args["author"], state=tkinter.DISABLED
+    ).grid(row=1, column=1, sticky=tkinter.W)
+    tkinter.Label(metadata_frame, text="creator", state=tkinter.DISABLED).grid(
+        row=2, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(
+        metadata_frame, textvariable=args["creator"], state=tkinter.DISABLED
+    ).grid(row=2, column=1, sticky=tkinter.W)
+    tkinter.Label(metadata_frame, text="producer", state=tkinter.DISABLED).grid(
+        row=3, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(
+        metadata_frame, textvariable=args["producer"], state=tkinter.DISABLED
+    ).grid(row=3, column=1, sticky=tkinter.W)
+    tkinter.Label(metadata_frame, text="creation date", state=tkinter.DISABLED).grid(
+        row=4, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(
+        metadata_frame, textvariable=args["creationdate"], state=tkinter.DISABLED
+    ).grid(row=4, column=1, sticky=tkinter.W)
+    tkinter.Label(
+        metadata_frame, text="modification date", state=tkinter.DISABLED
+    ).grid(row=5, column=0, sticky=tkinter.W)
+    tkinter.Entry(
+        metadata_frame, textvariable=args["moddate"], state=tkinter.DISABLED
+    ).grid(row=5, column=1, sticky=tkinter.W)
+    tkinter.Label(metadata_frame, text="subject", state=tkinter.DISABLED).grid(
+        row=6, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(metadata_frame, state=tkinter.DISABLED).grid(
+        row=6, column=1, sticky=tkinter.W
+    )
+    tkinter.Label(metadata_frame, text="keywords", state=tkinter.DISABLED).grid(
+        row=7, column=0, sticky=tkinter.W
+    )
+    tkinter.Entry(metadata_frame, state=tkinter.DISABLED).grid(
+        row=7, column=1, sticky=tkinter.W
+    )
+    viewer_frame = tkinter.LabelFrame(frame1.interior, text="PDF viewer options")
+    viewer_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+    tkinter.Label(viewer_frame, text="panes", state=tkinter.DISABLED).grid(
+        row=0, column=0, sticky=tkinter.W
+    )
+    OptionMenu(
+        viewer_frame,
+        args["viewer_panes"],
+        *(["auto"] + [v.name for v in PageMode]),
+        state=tkinter.DISABLED,
+    ).grid(row=0, column=1, sticky=tkinter.W)
+    tkinter.Label(viewer_frame, text="initial page", state=tkinter.DISABLED).grid(
+        row=1, column=0, sticky=tkinter.W
+    )
+    tkinter.Spinbox(
+        viewer_frame,
+        increment=1,
+        from_=1,
+        to=10000,
+        width=6,
+        textvariable=args["viewer_initial_page"],
+        state=tkinter.DISABLED,
+        name="viewer_initial_page_spinbox",
+    ).grid(row=1, column=1, sticky=tkinter.W)
+    tkinter.Label(viewer_frame, text="magnification", state=tkinter.DISABLED).grid(
+        row=2, column=0, sticky=tkinter.W
+    )
+    OptionMenu(
+        viewer_frame,
+        args["viewer_magnification"],
+        *(["auto", "custom"] + [v.name for v in Magnification]),
+        state=tkinter.DISABLED,
+    ).grid(row=2, column=1, sticky=tkinter.W)
+    tkinter.Label(viewer_frame, text="page layout", state=tkinter.DISABLED).grid(
+        row=3, column=0, sticky=tkinter.W
+    )
+    OptionMenu(
+        viewer_frame,
+        args["viewer_page_layout"],
+        *(["auto"] + [v.name for v in PageLayout]),
+        state=tkinter.DISABLED,
+    ).grid(row=3, column=1, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        viewer_frame,
+        text="fit window to page size",
+        variable=args["viewer_fit_window"],
+        state=tkinter.DISABLED,
+    ).grid(row=4, column=0, columnspan=2, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        viewer_frame,
+        text="center window",
+        variable=args["viewer_center_window"],
+        state=tkinter.DISABLED,
+    ).grid(row=5, column=0, columnspan=2, sticky=tkinter.W)
+    tkinter.Checkbutton(
+        viewer_frame,
+        text="open in fullscreen",
+        variable=args["viewer_fullscreen"],
+        state=tkinter.DISABLED,
+    ).grid(row=6, column=0, columnspan=2, sticky=tkinter.W)
+
+    option_frame = tkinter.LabelFrame(frame1.interior, text="Program options")
+    option_frame.pack(side=tkinter.TOP, expand=tkinter.TRUE, fill=tkinter.X)
+
+    tkinter.Label(option_frame, text="Unit:", state=tkinter.DISABLED).grid(
+        row=0, column=0, sticky=tkinter.W
+    )
+    unit = tkinter.StringVar()
+    unit.set("mm")
+    OptionMenu(option_frame, unit, ["mm"], state=tkinter.DISABLED).grid(
+        row=0, column=1, sticky=tkinter.W
+    )
+
+    tkinter.Label(option_frame, text="Language:", state=tkinter.DISABLED).grid(
+        row=1, column=0, sticky=tkinter.W
+    )
+    language = tkinter.StringVar()
+    language.set("English")
+    OptionMenu(option_frame, language, ["English"], state=tkinter.DISABLED).grid(
+        row=1, column=1, sticky=tkinter.W
+    )
+
+    bottom_frame = tkinter.Frame(frame_right)
+    bottom_frame.pack(fill=tkinter.X)
+
+    tkinter.Button(bottom_frame, text="Save PDF", command=on_save_button).pack(
+        side=tkinter.LEFT, expand=tkinter.TRUE, fill=tkinter.X
+    )
+    tkinter.Button(bottom_frame, text="Exit", command=root.destroy).pack(
+        side=tkinter.RIGHT, expand=tkinter.TRUE, fill=tkinter.X
+    )
+
+    app.mainloop()
+
+
+def file_is_icc(fname):
+    with open(fname, "rb") as f:
+        data = f.read(40)
+    if len(data) < 40:
+        return False
+    return data[36:] == b"acsp"
+
+
+def validate_icc(fname):
+    if not file_is_icc(fname):
+        raise argparse.ArgumentTypeError('"%s" is not an ICC profile' % fname)
+    return fname
+
+
+def get_default_icc_profile():
+    for profile in [
+        "/usr/share/color/icc/sRGB.icc",
+        "/usr/share/color/icc/OpenICC/sRGB.icc",
+        "/usr/share/color/icc/colord/sRGB.icc",
+    ]:
+        if not os.path.exists(profile):
+            continue
+        if not file_is_icc(profile):
+            continue
+        return profile
+    return "/usr/share/color/icc/sRGB.icc"
+
+
+def get_main_parser():
     rendered_papersizes = ""
     for k, v in sorted(papersizes.items()):
         rendered_papersizes += "    %-8s %s\n" % (papernames[k], v)
@@ -2178,9 +3869,9 @@ Losslessly convert raster images to PDF without re-encoding PNG, JPEG, and
 JPEG2000 images. This leads to a lossless conversion of PNG, JPEG and JPEG2000
 images with the only added file size coming from the PDF container itself.
 Other raster graphics formats are losslessly stored using the same encoding
-that PNG uses. Since PDF does not support images with transparency and since
-img2pdf aims to never be lossy, input images with an alpha channel are not
-supported.
+that PNG uses.
+For images with transparency, the alpha channel will be stored as a separate
+soft mask. This is lossless, too.
 
 The output is sent to standard output so that it can be redirected into a file
 or to another program as part of a shell pipe. To directly write the output
@@ -2207,7 +3898,9 @@ Paper sizes:
   the value in the second column has the same effect as giving the short hand
   in the first column. Appending ^T (a caret/circumflex followed by the letter
   T) turns the paper size from portrait into landscape. The postfix thus
-  symbolizes the transpose. The values are case insensitive.
+  symbolizes the transpose. Note that on Windows cmd.exe the caret symbol is
+  the escape character, so you need to put quotes around the option value.
+  The values are case insensitive.
 
 %s
 
@@ -2274,7 +3967,7 @@ Examples:
   while preserving its aspect ratio and a print border of 2 cm on the top and
   bottom and 2.5 cm on the left and right hand side.
 
-    $ img2pdf --output out.pdf --pagesize A4^T --border 2cm:2.5cm *.jpg
+    $ img2pdf --output out.pdf --pagesize "A4^T" --border 2cm:2.5cm *.jpg
 
   On each A4 page, fit images into a 10 cm times 15 cm rectangle but keep the
   original image size if the image is smaller than that.
@@ -2292,7 +3985,7 @@ Examples:
 
     $ img2pdf --output out.pdf --colorspace L input.jp2
 
-Written by Johannes 'josch' Schauer <josch@mister-muffin.de>
+Written by Johannes Schauer Marin Rodrigues <josch@mister-muffin.de>
 
 Report bugs at https://gitlab.mister-muffin.de/josch/img2pdf/issues
 """
@@ -2308,8 +4001,10 @@ Report bugs at https://gitlab.mister-muffin.de/josch/img2pdf/issues
         "the Python Imaging Library (PIL). If no input images are given, then "
         'a single image is read from standard input. The special filename "-" '
         "can be used once to read an image from standard input. To read a "
-        'file in the current directory with the filename "-", pass it to '
-        'img2pdf by explicitly stating its relative path like "./-".',
+        'file in the current directory with the filename "-" (or with a '
+        'filename starting with "-"), pass it to img2pdf by explicitly '
+        'stating its relative path like "./-". Cannot be used together with '
+        "--from-file.",
     )
     parser.add_argument(
         "-v",
@@ -2324,6 +4019,22 @@ Report bugs at https://gitlab.mister-muffin.de/josch/img2pdf/issues
         action="version",
         version="%(prog)s " + __version__,
         help="Prints version information and exits.",
+    )
+    parser.add_argument(
+        "--gui", dest="gui", action="store_true", help="run experimental tkinter gui"
+    )
+    parser.add_argument(
+        "--from-file",
+        metavar="FILE",
+        type=from_file,
+        default=[],
+        help="Read the list of images from FILE instead of passing them as "
+        "positional arguments. If this option is used, then the list of "
+        "positional arguments must be empty. The paths to the input images "
+        'in FILE are separated by NUL bytes. If FILE is "-" then the paths '
+        "are expected on standard input. This option is useful if you want "
+        "to pass more images than the maximum command length of your shell "
+        "permits. This option can be used with commands like `find -print0`.",
     )
 
     outargs = parser.add_argument_group(
@@ -2368,15 +4079,18 @@ RGB.""",
     )
 
     outargs.add_argument(
-        "--without-pdfrw",
-        action="store_true",
-        help="By default, img2pdf uses the pdfrw library to create the output "
-        "PDF if pdfrw is available. If you want to use the internal PDF "
-        "generator of img2pdf even if pdfrw is present, then pass this "
-        "option. This can be useful if you want to have unicode metadata "
-        "values which pdfrw does not yet support (See "
-        "https://github.com/pmaupin/pdfrw/issues/39) or if you want the "
-        "PDF code to be more human readable.",
+        "--engine",
+        metavar="engine",
+        type=parse_enginearg,
+        help="Choose PDF engine. Can be either internal, pikepdf or pdfrw. "
+        "The internal engine does not have additional requirements and writes "
+        "out a human readable PDF. The pikepdf engine requires the pikepdf "
+        "Python module and qpdf library, is most featureful, can "
+        'linearize PDFs ("fast web view") and can compress more parts of it.'
+        "The pdfrw engine requires the pdfrw Python "
+        "module but does not support unicode metadata (See "
+        "https://github.com/pmaupin/pdfrw/issues/39) or palette data (See "
+        "https://github.com/pmaupin/pdfrw/issues/128).",
     )
 
     outargs.add_argument(
@@ -2389,6 +4103,17 @@ RGB.""",
     )
 
     outargs.add_argument(
+        "--include-thumbnails",
+        action="store_true",
+        help="Some multi-frame formats like MPO carry a main image and "
+        "one or more scaled-down copies of the main image (thumbnails). "
+        "In such a case, img2pdf will only include the main image and "
+        "not create additional pages for each of the thumbnails. If this "
+        "option is set, img2pdf will instead create one page per frame and "
+        "thus store each thumbnail on its own page.",
+    )
+
+    outargs.add_argument(
         "--pillow-limit-break",
         action="store_true",
         help="img2pdf uses the Python Imaging Library Pillow to read input "
@@ -2398,6 +4123,30 @@ RGB.""",
         "option to disable this safety measure during this run of img2pdf"
         % Image.MAX_IMAGE_PIXELS,
     )
+
+    if sys.platform == "win32":
+        # on Windows, there are no default paths to search for an ICC profile
+        # so make the argument required instead of optional
+        outargs.add_argument(
+            "--pdfa",
+            type=validate_icc,
+            help="Output a PDF/A-1b compliant document. The argument to this "
+            "option is the path to the ICC profile that will be embedded into "
+            "the resulting PDF.",
+        )
+    else:
+        outargs.add_argument(
+            "--pdfa",
+            nargs="?",
+            const=get_default_icc_profile(),
+            default=None,
+            type=validate_icc,
+            help="Output a PDF/A-1b compliant document. By default, this will "
+            "embed either /usr/share/color/icc/sRGB.icc, "
+            "/usr/share/color/icc/OpenICC/sRGB.icc or "
+            "/usr/share/color/icc/colord/sRGB.icc as the color profile, whichever "
+            "is found to exist first.",
+        )
 
     sizeargs = parser.add_argument_group(
         title="Image and page size and layout arguments",
@@ -2443,6 +4192,8 @@ the image size will be calculated from the page size, respecting the border
 setting. If the --border option is given while both the --pagesize and
 --imgsize options are passed, then the --border option will be ignored.
 
+The --pagesize option or the --imgsize option with the --border option will
+determine the MediaBox size of the resulting PDF document.
 """
         % default_dpi,
     )
@@ -2510,6 +4261,68 @@ If both dimensions of the page are given via --pagesize, conditionally swaps
 these dimensions such that the page orientation is the same as the orientation
 of the input image. If the orientation of a page gets flipped, then so do the
 values set via the --border option.
+""",
+    )
+    sizeargs.add_argument(
+        "-r",
+        "--rotation",
+        "--orientation",
+        metavar="ROT",
+        type=parse_rotationarg,
+        default=Rotation.auto,
+        help="""
+Specifies how input images should be rotated. ROT can be one of auto, none,
+ifvalid, 0, 90, 180 and 270. The default value is auto and indicates that input
+images are rotated according to their EXIF Orientation tag. The values none and
+0 ignore the EXIF Orientation values of the input images. The value ifvalid
+acts like auto but ignores invalid EXIF rotation values and only issues a
+warning instead of throwing an error. This is useful because many devices like
+Android phones, Canon cameras or scanners emit an invalid Orientation tag value
+of zero. The values 90, 180 and 270 perform a clockwise rotation of the image.
+            """,
+    )
+    sizeargs.add_argument(
+        "--crop-border",
+        metavar="L[:L]",
+        type=parse_borderarg,
+        help="""
+Specifies the border between the CropBox and the MediaBox. One, or two length
+values can be given as an argument, separated by a colon. One value specifies
+the border on all four sides. Two values specify the border on the top/bottom
+and left/right, respectively. It is not possible to specify asymmetric borders.
+""",
+    )
+    sizeargs.add_argument(
+        "--bleed-border",
+        metavar="L[:L]",
+        type=parse_borderarg,
+        help="""
+Specifies the border between the BleedBox and the MediaBox. One, or two length
+values can be given as an argument, separated by a colon. One value specifies
+the border on all four sides. Two values specify the border on the top/bottom
+and left/right, respectively. It is not possible to specify asymmetric borders.
+""",
+    )
+    sizeargs.add_argument(
+        "--trim-border",
+        metavar="L[:L]",
+        type=parse_borderarg,
+        help="""
+Specifies the border between the TrimBox and the MediaBox. One, or two length
+values can be given as an argument, separated by a colon. One value specifies
+the border on all four sides. Two values specify the border on the top/bottom
+and left/right, respectively. It is not possible to specify asymmetric borders.
+""",
+    )
+    sizeargs.add_argument(
+        "--art-border",
+        metavar="L[:L]",
+        type=parse_borderarg,
+        help="""
+Specifies the border between the ArtBox and the MediaBox. One, or two length
+values can be given as an argument, separated by a colon. One value specifies
+the border on all four sides. Two values specify the border on the top/bottom
+and left/right, respectively. It is not possible to specify asymmetric borders.
 """,
     )
 
@@ -2603,12 +4416,14 @@ values set via the --border option.
         'Valid values are "single" (display single pages), "onecolumn" '
         '(one continuous column), "twocolumnright" (two continuous '
         'columns with odd number pages on the right) and "twocolumnleft" '
-        "(two continuous columns with odd numbered pages on the left)",
+        "(two continuous columns with odd numbered pages on the left), "
+        '"twopageright" (two pages with odd numbered page on the right) '
+        'and "twopageleft" (two pages with odd numbered page on the left)',
     )
     viewerargs.add_argument(
         "--viewer-fit-window",
         action="store_true",
-        help="Instruct the PDF viewer to resize the window to fit the page " "size",
+        help="Instruct the PDF viewer to resize the window to fit the page size",
     )
     viewerargs.add_argument(
         "--viewer-center-window",
@@ -2620,8 +4435,11 @@ values set via the --border option.
         action="store_true",
         help="Instruct the PDF viewer to open the PDF in fullscreen mode",
     )
+    return parser
 
-    args = parser.parse_args(argv[1:])
+
+def main(argv=sys.argv):
+    args = get_main_parser().parse_args(argv[1:])
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
@@ -2629,43 +4447,61 @@ values set via the --border option.
     if args.pillow_limit_break:
         Image.MAX_IMAGE_PIXELS = None
 
+    if args.gui:
+        gui()
+        sys.exit(0)
+
     layout_fun = get_layout_fun(
         args.pagesize, args.imgsize, args.border, args.fit, args.auto_orient
     )
 
-    # if no positional arguments were supplied, read a single image from
-    # standard input
-    if len(args.images) == 0:
-        logging.info("reading image from standard input")
+    if len(args.images) > 0 and len(args.from_file) > 0:
+        logger.error(
+            "%s: error: cannot use --from-file with positional arguments" % parser.prog
+        )
+        sys.exit(2)
+    elif len(args.images) == 0 and len(args.from_file) == 0:
+        # if no positional arguments were supplied, read a single image from
+        # standard input
+        print(
+            "Reading image from standard input...\n"
+            "Re-run with -h or --help for usage information.",
+            file=sys.stderr,
+        )
         try:
-            if PY3:
-                args.images = [sys.stdin.buffer.read()]
-            else:
-                args.images = [sys.stdin.read()]
+            images = [sys.stdin.buffer.read()]
         except KeyboardInterrupt:
-            exit(0)
+            sys.exit(0)
+    elif len(args.images) > 0 and len(args.from_file) == 0:
+        # On windows, each positional argument can expand into multiple paths
+        # because we do globbing ourselves. Here we flatten the list of lists
+        # again.
+        images = list(chain.from_iterable(args.images))
+    elif len(args.images) == 0 and len(args.from_file) > 0:
+        images = args.from_file
 
     # with the number of pages being equal to the number of images, the
     # value passed to --viewer-initial-page must be between 1 and that number
     if args.viewer_initial_page is not None:
         if args.viewer_initial_page < 1:
             parser.print_usage(file=sys.stderr)
-            logging.error(
+            logger.error(
                 "%s: error: argument --viewer-initial-page: must be "
                 "greater than zero" % parser.prog
             )
-            exit(2)
-        if args.viewer_initial_page > len(args.images):
+            sys.exit(2)
+        if args.viewer_initial_page > len(images):
             parser.print_usage(file=sys.stderr)
-            logging.error(
+            logger.error(
                 "%s: error: argument --viewer-initial-page: must be "
                 "less than or equal to the total number of pages" % parser.prog
             )
-            exit(2)
+            sys.exit(2)
 
     try:
         convert(
-            *args.images,
+            *images,
+            engine=args.engine,
             title=args.title,
             author=args.author,
             creator=args.creator,
@@ -2684,17 +4520,23 @@ values set via the --border option.
             viewer_fit_window=args.viewer_fit_window,
             viewer_center_window=args.viewer_center_window,
             viewer_fullscreen=args.viewer_fullscreen,
-            with_pdfrw=not args.without_pdfrw,
             outputstream=args.output,
-            first_frame_only=args.first_frame_only
+            first_frame_only=args.first_frame_only,
+            cropborder=args.crop_border,
+            bleedborder=args.bleed_border,
+            trimborder=args.trim_border,
+            artborder=args.art_border,
+            pdfa=args.pdfa,
+            rotation=args.rotation,
+            include_thumbnails=args.include_thumbnails,
         )
     except Exception as e:
-        logging.error("error: " + str(e))
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logger.error("error: " + str(e))
+        if logger.isEnabledFor(logging.DEBUG):
             import traceback
 
             traceback.print_exc(file=sys.stderr)
-        exit(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

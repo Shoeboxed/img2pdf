@@ -1,3 +1,6 @@
+[![Travis Status](https://travis-ci.com/josch/img2pdf.svg?branch=main)](https://app.travis-ci.com/josch/img2pdf)
+[![Appveyor Status](https://ci.appveyor.com/api/projects/status/2kws3wkqvi526llj/branch/main?svg=true)](https://ci.appveyor.com/project/josch/img2pdf/branch/main)
+
 img2pdf
 =======
 
@@ -24,15 +27,15 @@ software, because the raw pixel data never has to be loaded into memory.
 The following table shows how img2pdf handles different input depending on the
 input file format and image color space.
 
-| Format               | Colorspace                     | Result        |
-| -------------------- | ------------------------------ | ------------- |
-| JPEG                 | any                            | direct        |
-| JPEG2000             | any                            | direct        |
-| PNG (non-interlaced) | any                            | direct        |
-| TIFF (CCITT Group 4) | monochrome                     | direct        |
-| any                  | any except CMYK and monochrome | PNG Paeth     |
-| any                  | monochrome                     | CCITT Group 4 |
-| any                  | CMYK                           | flate         |
+| Format                                | Colorspace                     | Result        |
+| ------------------------------------- | ------------------------------ | ------------- |
+| JPEG                                  | any                            | direct        |
+| JPEG2000                              | any                            | direct        |
+| PNG (non-interlaced, no transparency) | any                            | direct        |
+| TIFF (CCITT Group 4)                  | monochrome                     | direct        |
+| any                                   | any except CMYK and monochrome | PNG Paeth     |
+| any                                   | monochrome                     | CCITT Group 4 |
+| any                                   | CMYK                           | flate         |
 
 For JPEG, JPEG2000, non-interlaced PNG and TIFF images with CCITT Group 4
 encoded data, img2pdf directly embeds the image data into the PDF without
@@ -69,15 +72,15 @@ Bugs
    when embedded into the PDF cannot be read by the Adobe Acrobat Reader,
    please contact me.
 
- - I have not yet figured out how to determine the colorspace of JPEG2000
-   files.  Therefore JPEG2000 files use DeviceRGB by default. For JPEG2000
-   files with other colorspaces, you must explicitly specify it using the
-   `--colorspace` option.
-
- - Input images with alpha channels are not allowed. PDF doesn't support alpha
-   channels in images and thus, the alpha channel of the input would have to be
-   discarded. But img2pdf will always be lossless and thus, input images must
-   not carry transparency information.
+ - An error is produced if the input image is broken. This commonly happens if
+   the input image has an invalid EXIF Orientation value of zero. Even though
+   only nine different values from 1 to 9 are permitted, Anroid phones and
+   Canon DSLR cameras produce JPEG images with the invalid value of zero.
+   Either fix your input images with `exiftool` or similar software before
+   passing the JPEG to `img2pdf` or run `img2pdf` with `--rotation=ifvalid`
+   (if you run img2pdf from the commandline) or by passing
+   `rotation=img2pdf.Rotation.ifvalid` as an argument to `convert()` when using
+   img2pdf as a library.
 
  - img2pdf uses PIL (or Pillow) to obtain image meta data and to convert the
    input if necessary. To prevent decompression bomb denial of service attacks,
@@ -114,6 +117,23 @@ You can then test the converter using:
 
 	$ ve/bin/img2pdf -o test.pdf src/tests/test.jpg
 
+If you don't want to setup Python on Windows, then head to the
+[releases](/josch/img2pdf/releases) section and download the latest
+`img2pdf.exe`.
+
+GUI
+---
+
+There exists an experimental GUI with all settings currently disabled. You can
+directly convert images to PDF but you cannot set any options via the GUI yet.
+If you are interested in adding more features to the PDF, please submit a merge
+request. The GUI is based on tkinter and works on Linux, Windows and MacOS.
+
+![](screenshot.png)
+
+Library
+-------
+
 The package can also be used as a library:
 
 	import img2pdf
@@ -125,6 +145,10 @@ The package can also be used as a library:
 	# opening from file handle
 	with open("name.pdf","wb") as f1, open("test.jpg") as f2:
 		f1.write(img2pdf.convert(f2))
+
+	# opening using pathlib
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(pathlib.Path('test.jpg')))
 
 	# using in-memory image data
 	with open("name.pdf","wb") as f:
@@ -138,6 +162,45 @@ The package can also be used as a library:
 	with open("name.pdf","wb") as f:
 		f.write(img2pdf.convert(["test1.jpg", "test2.png"]))
 
+	# convert all files ending in .jpg inside a directory
+	dirname = "/path/to/images"
+	imgs = []
+	for fname in os.listdir(dirname):
+		if not fname.endswith(".jpg"):
+			continue
+		path = os.path.join(dirname, fname)
+		if os.path.isdir(path):
+			continue
+		imgs.append(path)
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(imgs))
+
+	# convert all files ending in .jpg in a directory and its subdirectories
+	dirname = "/path/to/images"
+	imgs = []
+	for r, _, f in os.walk(dirname):
+		for fname in f:
+			if not fname.endswith(".jpg"):
+				continue
+			imgs.append(os.path.join(r, fname))
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(imgs))
+
+
+	# convert all files matching a glob
+	import glob
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(glob.glob("/path/to/*.jpg")))
+
+	# convert all files matching a glob using pathlib.Path
+	from pathlib import Path
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert(*Path("/path").glob("**/*.jpg")))
+
+	# ignore invalid rotation values in the input images
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert('test.jpg'), rotation=img2pdf.Rotation.ifvalid)
+
 	# writing to file descriptor
 	with open("name.pdf","wb") as f1, open("test.jpg") as f2:
 		img2pdf.convert(f2, outputstream=f1)
@@ -147,6 +210,16 @@ The package can also be used as a library:
 	layout_fun = img2pdf.get_layout_fun(a4inpt)
 	with open("name.pdf","wb") as f:
 		f.write(img2pdf.convert('test.jpg', layout_fun=layout_fun))
+
+	# use a fixed dpi of 300 instead of reading it from the image
+	dpix = dpiy = 300
+	layout_fun = img2pdf.get_fixed_dpi_layout_fun((dpix, dpiy))
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert('test.jpg', layout_fun=layout_fun))
+
+	# create a PDF/A-1b compliant document by passing an ICC profile
+	with open("name.pdf","wb") as f:
+		f.write(img2pdf.convert('test.jpg', pdfa="/usr/share/color/icc/sRGB.icc"))
 
 Comparison to ImageMagick
 -------------------------
@@ -206,6 +279,24 @@ of the plain pixel data and thus needlessly increases the output file size:
 	4500182 original.png
 	9318120 pdflatex.pdf
 
+Comparison to podofoimg2pdf
+---------------------------
+
+Like pdfLaTeX, podofoimg2pdf is able to perform a lossless conversion from JPEG
+to PDF by plainly embedding the JPEG data into the pdf container. But just like
+pdfLaTeX it uses flate compression for all other file formats, thus sometimes
+resulting in larger files than necessary.
+
+	$ convert logo: -resize 8000x original.png
+	$ podofoimg2pdf out.pdf original.png
+	stat --format="%s %n" original.png out.pdf
+	4500181 original.png
+	9335629 out.pdf
+
+It also only supports JPEG, PNG and TIF as input and lacks many of the
+convenience features of img2pdf like page sizes, borders, rotation and
+metadata.
+
 Comparison to Tesseract OCR
 ---------------------------
 
@@ -216,3 +307,15 @@ you should safely be able to use Tesseract instead of img2pdf. For other input,
 Tesseract might not do a lossless conversion. For example it converts CMYK
 input to RGB and removes the alpha channel from images with transparency. For
 multipage TIFF or animated GIF, it will only convert the first frame.
+
+Comparison to econvert from ExactImage
+--------------------------------------
+
+Like pdflatex and podofoimg2pf, econvert is able to embed JPEG images into PDF
+directly without re-encoding but when given other file formats, it stores them
+just using flate compressen, which unnecessarily increases the filesize.
+Furthermore, it throws an error with CMYK TIF input. It also doesn't store CMYK
+jpeg files as CMYK but converts them to RGB, so it's not lossless. When trying
+to feed it 16bit files, it errors out with Unhandled bps/spp combination. It
+also seems to choose JPEG encoding when using it on some file types (like
+palette images) making it again not lossless for that input as well.
