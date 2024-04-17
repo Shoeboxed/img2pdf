@@ -62,7 +62,7 @@ try:
 except ImportError:
     have_pikepdf = False
 
-__version__ = "0.5.1+sbx"
+__version__ = "0.5.1+sbx2"
 default_dpi = 96.0
 papersizes = {
     "letter": "8.5inx11in",
@@ -1916,7 +1916,7 @@ def read_images(
                 and mpent["Attribute"]["RepresentativeImageFlag"]
                 and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
             ) or (
-                imgdata.getexif()[271] == "Apple"  # Exif 271 is "Make"
+                imgdata.getexif().get(271) == "Apple"  # Exif 271 is "Make"
                 and mpent["Attribute"]["MPType"] == "Baseline MP Primary Image"
             ):
                 num_main_frames += 1
@@ -1930,7 +1930,7 @@ def read_images(
                     "Large Thumbnail (Full HD Equivalent)",
                 ]
             ) or (
-                imgdata.getexif()[271] == "Apple"  # Exif 271 is "Make"
+                imgdata.getexif().get(271) == "Apple"  # Exif 271 is "Make"
                 and mpent["Attribute"]["MPType"] == "Undefined"
             ):
                 num_thumbnail_frames += 1

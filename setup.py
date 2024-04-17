@@ -1,7 +1,7 @@
 import sys
 from setuptools import setup
 
-VERSION = "0.5.1+sbx"
+VERSION = "0.5.1+sbx2"
 
 INSTALL_REQUIRES = (
     "Pillow",
